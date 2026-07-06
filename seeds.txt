@@ -1,0 +1,3 @@
+# Sosaiem seed nodes (optional) -- one URL per line, e.g.
+# http://203.0.113.7:7000
+# If this file lists nothing, your node asks sosaiem.com/seeds.txt instead.
