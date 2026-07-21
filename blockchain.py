@@ -1,8 +1,36 @@
-"""Block and Blockchain with proof-of-work and auto-adjusting difficulty."""
+"""Block and Blockchain with memory-hard proof-of-work and auto-adjusting difficulty."""
 
 import hashlib
 import json
 import time
+
+
+# --- proof of work ---------------------------------------------------------
+# Mining should be something an ordinary computer can do, not a thing you buy
+# your way into. So the work is deliberately *memory-hard*: every attempt has
+# to allocate and randomly walk a large block of memory.
+#
+# Custom mining chips win at plain SHA-256 by stamping thousands of tiny
+# hashing cores onto one piece of silicon. That trick collapses when each core
+# needs its own 16 MB of fast memory -- the memory, not the arithmetic, becomes
+# the cost, and a chip built that way ends up looking like an ordinary CPU with
+# ordinary RAM. Litecoin used this idea but chose only 128 KB, which was small
+# enough that chips caught up. 16 MB is 128 times that.
+#
+# It has a second benefit that matters for a project written in Python: nearly
+# all the time is spent inside one C function, so somebody who rewrites the
+# miner in C gains almost nothing. The playing field stays level.
+POW_SALT = b"SOSAIEM-pow-scrypt-v2"
+POW_N = 1 << 13          # 8 MB per attempt -- 64x Litecoin's setting
+POW_R = 8
+POW_P = 1
+POW_MAXMEM = 2147483646
+
+
+def memory_hard(data: bytes) -> str:
+    """The one piece of work in the whole system. Everything costly uses this."""
+    return hashlib.scrypt(data, salt=POW_SALT, n=POW_N, r=POW_R, p=POW_P,
+                          maxmem=POW_MAXMEM, dklen=32).hex()
 
 
 class Block:
@@ -17,20 +45,33 @@ class Block:
         self.tx_hash = hashlib.sha256(
             json.dumps(self.transactions, sort_keys=True).encode()).hexdigest()
 
-    def compute_hash(self):
-        header = json.dumps({
+    def header_json(self):
+        return json.dumps({
             "index": self.index,
             "timestamp": self.timestamp,
             "tx_hash": self.tx_hash,
             "previous_hash": self.previous_hash,
             "nonce": self.nonce,
         }, sort_keys=True)
-        return hashlib.sha256(header.encode()).hexdigest()
+
+    def compute_hash(self):
+        """
+        The block's name. Cheap on purpose -- it is used for linking blocks
+        together and looking them up, which happens constantly.
+        """
+        return hashlib.sha256(self.header_json().encode()).hexdigest()
+
+    def pow_hash(self):
+        """
+        The number that has to come out small enough. Expensive on purpose --
+        this is the work in proof-of-work.
+        """
+        return memory_hard(self.header_json().encode())
 
 
-TARGET_BLOCK_SECONDS = 10
+TARGET_BLOCK_SECONDS = 60
 MAX_TARGET = (1 << 256) - 1
-INITIAL_BITS = 20
+INITIAL_BITS = 12
 INITIAL_TARGET = 1 << (256 - INITIAL_BITS)
 ADJUST_WINDOW = 8
 GAP_CAP = 2 * TARGET_BLOCK_SECONDS
@@ -89,7 +130,7 @@ class Blockchain:
 
     def _mine_block(self, block):
         target = next_target(self.chain)
-        while int(block.compute_hash(), 16) >= target:
+        while int(block.pow_hash(), 16) >= target:
             block.nonce += 1
         return block.compute_hash()
 
@@ -110,18 +151,29 @@ class Blockchain:
         self.pending_transactions = []
         print(f"done in {elapsed:.2f}s  (nonce={new_block.nonce}, hash={valid_hash[:16]}...)")
 
-    def is_chain_valid(self):
+    def is_chain_valid(self, skip_work=None):
+        """
+        Check the chain holds together.
+
+        `skip_work` is a set of block hashes whose proof-of-work this node has
+        already verified. The link check below still runs on every block every
+        time, and it is that check which catches a tampered block: changing any
+        block changes its hash, which breaks the next block's back-reference.
+        Only the expensive re-hashing is skipped.
+        """
         targets = compute_targets(self.chain)
         for i in range(1, len(self.chain)):
             current = self.chain[i]
             previous = self.chain[i - 1]
 
-            if int(current.compute_hash(), 16) >= targets[i]:
-                print(f"  ! Block {current.index} fails proof-of-work.")
-                return False
-
             if current.previous_hash != previous.compute_hash():
                 print(f"  ! Block {current.index} is not linked to block {previous.index} -- chain broken!")
+                return False
+
+            if skip_work is not None and current.compute_hash() in skip_work:
+                continue
+            if int(current.pow_hash(), 16) >= targets[i]:
+                print(f"  ! Block {current.index} fails proof-of-work.")
                 return False
 
         return True

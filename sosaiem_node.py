@@ -9,18 +9,39 @@ import socket
 import hashlib
 import threading
 import collections
+import urllib.parse
 import urllib.request
+
+import portmap
+import nostrseed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from wallet import Wallet, verify_signature
-from blockchain import Blockchain, Block, next_target, compute_targets, MAX_TARGET
+from blockchain import (Blockchain, Block, next_target, compute_targets,
+                        MAX_TARGET, memory_hard)
 from coin import (compute_balances, total_minted, remaining_supply,
-                  make_transfer, make_reward, transfer_is_valid,
+                  make_transfer, make_reward, transfer_is_valid, amount_is_sane,
                   _address_from_pubkey, BLOCK_REWARD, MAX_SUPPLY,
                   TARGET_BLOCK_SECONDS)
 
 
 SYNC_INTERVAL = 3
+
+# --- versions -----------------------------------------------------------
+# PROTOCOL_VERSION describes the *consensus rules*: what makes a block or a
+# transfer valid. Two nodes with different protocol versions may disagree about
+# the chain itself and quietly drift apart, so this number exists to make that
+# disagreement visible instead of silent.
+#
+# Bump it ONLY when a rule changes -- the block reward, the supply cap, how a
+# hash is built, what a valid signature is. When you do, give people an
+# activation height and time to update, or the network splits into two coins.
+#
+# NODE_VERSION is just the build. Change it freely: new endpoints, a nicer
+# window, faster syncing, bug fixes that only tighten what was already invalid.
+# Nobody has to agree on it and nothing can split over it.
+PROTOCOL_VERSION = 2
+NODE_VERSION = "2.0.0"
 DISCOVERY_PORT = 54546
 DISCOVERY_INTERVAL = 4
 
@@ -57,11 +78,25 @@ def rate_allowed(ip):
 
 
 SHARE_EASE = 32
-MAX_SHARES_PER_BLOCK = 2000
+# Every share in a block must be re-verified by every node, and a share now
+# costs real memory and time. 2000 of them would make a single block take
+# most of a minute to check, which is a denial-of-service dressed as a block.
+MAX_SHARES_PER_BLOCK = 128
 
 
 def share_hash(prev_hash, address, nonce):
-    return hashlib.sha256(f"SOSA-share|{prev_hash}|{address}|{nonce}".encode()).hexdigest()
+    """
+    A work share proves a miner was genuinely working, and shares decide how
+    the block reward is split.
+
+    This has to cost exactly what block-finding costs. If shares were cheap
+    SHA-256 while blocks were memory-hard, someone with fast dedicated hardware
+    could flood the network with shares and collect most of the reward without
+    ever doing the expensive work -- and honest miners would be forced to
+    include those shares in the blocks they found. Hardening the block alone
+    would have left the front door open.
+    """
+    return memory_hard(f"SOSA-share|{prev_hash}|{address}|{nonce}".encode())
 
 
 def share_target_for(block_target):
@@ -124,8 +159,9 @@ def _check_block_content(transactions, prev_hash, share_target):
         if t == "shares":
             shares_entries.append(tx)
         elif t == "reward":
-            amt = tx.get("amount", 0)
-            if not isinstance(amt, (int, float)) or amt < 0:
+            if not amount_is_sane(tx.get("amount"), allow_zero=True):
+                return False, 0.0
+            if not isinstance(tx.get("to"), str) or not tx["to"].startswith("SOSA"):
                 return False, 0.0
             rewards.append(tx)
         else:
@@ -173,17 +209,40 @@ def _check_block_content(transactions, prev_hash, share_target):
     return True, block_reward
 
 
+# Blocks whose expensive proofs this node has already checked, keyed by the
+# block's own (cheap) hash. Re-running memory-hard work on a chain we have
+# already accepted would make start-up take hours -- but the cheap structural
+# checks below still run on every block every time, so a tampered old block
+# still breaks the links and gets caught.
+_verified_work = set()
+_VERIFIED_CAP = 200000
+
+
+def _remember_verified(block_id):
+    if len(_verified_work) >= _VERIFIED_CAP:
+        _verified_work.clear()
+    _verified_work.add(block_id)
+
+
 def validate_full_chain(chain):
     if not chain.chain:
         return False
     if chain.chain[0].compute_hash() != _CANONICAL_GENESIS_HASH:
         return False
-    if not chain.is_chain_valid():
+    # link integrity, timestamps and difficulty -- cheap, always checked in full
+    if not chain.is_chain_valid(skip_work=_verified_work):
         return False
     targets = compute_targets(chain.chain)
     minted = 0.0
     for block in chain.chain:
         if block.index == 0:
+            continue
+        bid = block.compute_hash()
+        if bid in _verified_work:
+            # we have already re-done this block's work; still count its reward
+            for tx in block.transactions:
+                if isinstance(tx, dict) and tx.get("type") == "reward":
+                    minted += tx.get("amount", 0.0)
             continue
         ok, block_reward = _check_block_content(
             block.transactions, block.previous_hash, share_target_for(targets[block.index]))
@@ -192,6 +251,7 @@ def validate_full_chain(chain):
         if block_reward > BLOCK_REWARD + 1e-6:
             return False
         minted += block_reward
+        _remember_verified(bid)
     if minted > MAX_SUPPLY + 1e-6:
         return False
     return True
@@ -203,7 +263,7 @@ def validate_new_block(chain, block):
     if block.index != chain.last_block.index + 1:
         return False
     target = next_target(chain.chain)
-    if int(block.compute_hash(), 16) >= target:
+    if int(block.pow_hash(), 16) >= target:
         return False
     ok, block_reward = _check_block_content(
         block.transactions, block.previous_hash, share_target_for(target))
@@ -214,6 +274,17 @@ def validate_new_block(chain, block):
     if total_minted(chain) + block_reward > MAX_SUPPLY + 1e-6:
         return False
     return True
+
+
+def _no_constants(_name):
+    # JSON permits the bare tokens NaN, Infinity and -Infinity, and Python
+    # parses them happily. They must never reach the ledger, so refuse them at
+    # the door rather than trying to catch them at every later comparison.
+    raise ValueError("non-finite numbers are not accepted")
+
+
+def loads_strict(text):
+    return json.loads(text, parse_constant=_no_constants)
 
 
 def is_better(candidate, current):
@@ -277,6 +348,12 @@ class Node:
         # but a dedicated miner can point it at any address (no keys needed)
         self.payout_address = self.wallet.address()
         self._last_push_len = 0
+        self.warned_peers = set()
+        self.reachable = False        # confirmed by a peer, never assumed
+        self.public_url = None        # how the outside world sees us
+        self.upnp_opened = False
+        self.no_upnp = False
+        self.no_nostr = False
 
         self.cur_shares = {"prev": None, "by": {}, "version": 0}
         self._load_validators()
@@ -288,9 +365,25 @@ class Node:
         if os.path.exists(self.wallet_file):
             w = Wallet.load_from_file(self.wallet_file)
             print(f"  Loaded wallet: {w.address()}")
+            if not w.has_phrase():
+                print("  (this wallet predates recovery phrases -- it has no backup words.")
+                print("   to get a recoverable wallet, make a new one and send your SOSA to it.)")
         else:
-            w = Wallet(); w.save_to_file(self.wallet_file)
-            print(f"  New wallet: {w.address()}")
+            try:
+                w, phrase = Wallet.create_with_phrase()
+                w.save_to_file(self.wallet_file)
+                print(f"  New wallet: {w.address()}")
+                print("\n  ================= WRITE THESE WORDS DOWN =================")
+                for i in range(0, len(phrase.split()), 6):
+                    print("    " + " ".join(phrase.split()[i:i + 6]))
+                print("  These 17 words are the only way back to this wallet if you")
+                print("  lose this computer. Anyone who reads them owns your coins.")
+                print("  =========================================================\n")
+            except Exception as e:
+                # a wallet that works beats no wallet -- but say so plainly
+                w = Wallet(); w.save_to_file(self.wallet_file)
+                print(f"  New wallet: {w.address()}")
+                print(f"  (no recovery phrase: {e})")
         return w
 
     def _load_chain(self):
@@ -363,9 +456,20 @@ class Node:
                 continue
             if not all(vote_is_valid(v) for v in votes.values()):
                 continue
+            # Re-check that these votes really were a stake majority. The file
+            # on disk is just a cache -- if it is stale, edited or corrupted it
+            # must not be able to hand anyone coins on the next start-up.
+            good = {a: v for a, v in votes.items()
+                    if v.get("tx_signature") == sig and v.get("validator") == a}
+            balances = compute_balances(self.chain)
+            total = sum(max(b, 0.0) for b in balances.values())
+            yes = sum(max(balances.get(a, 0), 0.0)
+                      for a, v in good.items() if v.get("approve"))
+            if total <= 0 or yes * 2 <= total:
+                continue
             self.transfers[sig] = tx
-            self.votes[sig] = dict(votes)
-            self.confirmed_log.append({"tx": tx, "votes": dict(votes)})
+            self.votes[sig] = dict(good)
+            self.confirmed_log.append({"tx": tx, "votes": dict(good)})
             self.confirmed.add(sig)
             kept += 1
         if kept:
@@ -464,7 +568,7 @@ def post_json(url, obj, timeout=3):
                                      headers={"Content-Type": "application/json"},
                                      method="POST")
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read())
+            return loads_strict(r.read())
     except Exception:
         return None
 
@@ -472,7 +576,7 @@ def post_json(url, obj, timeout=3):
 def get_json(url, timeout=5):
     try:
         with urllib.request.urlopen(url, timeout=timeout) as r:
-            return json.loads(r.read())
+            return loads_strict(r.read())
     except Exception:
         return None
 
@@ -662,7 +766,7 @@ def make_handler(node):
             n = int(self.headers.get("Content-Length", 0))
             if n > cap:
                 raise ValueError("request body too large")
-            return json.loads(self.rfile.read(min(n, cap)))
+            return loads_strict(self.rfile.read(min(n, cap)))
 
         def _local(self):
             return self.client_address[0] in ("127.0.0.1", "::1")
@@ -696,21 +800,224 @@ def make_handler(node):
                 if not self._local():
                     self._json({"error": "localhost-only"}, 403); return
                 self._json(api_summary(node))
+            elif self.path == "/seeds":
+                # Ways into the network, as far as this node knows. Any node can
+                # answer this, so a newcomer who reaches one machine immediately
+                # learns about many -- nobody has to maintain a list by hand.
+                self._json({"seeds": good_seeds(node), "from": node.public_url or None})
+
             elif self.path == "/peers":
                 with node.lock:
-                    self._json({"peers": sorted(node.peers | {node.my_url})})
+                    # Only offer ourselves as a way in if the outside world can
+                    # actually get here. Handing newcomers an address that
+                    # silently fails is worse than handing them nothing.
+                    known = set(node.peers)
+                    if node.reachable and node.public_url:
+                        known.add(node.public_url)
+                    self._json({"peers": sorted(known)})
+
+            elif self.path.startswith("/reachme"):
+                # A peer is asking whether we can see it. We only ever try the
+                # address it is calling from, never one it names -- so this
+                # cannot be used to make us knock on somebody else's door.
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                try:
+                    p = int(q.get("port", ["0"])[0])
+                except ValueError:
+                    p = 0
+                if not (1 <= p <= 65535):
+                    self._json({"error": "bad port"}, 400); return
+                who = self.client_address[0]
+                seen = False
+                try:
+                    with urllib.request.urlopen(f"http://{who}:{p}/info", timeout=4) as r:
+                        seen = (loads_strict(r.read()).get("genesis")
+                                == _CANONICAL_GENESIS_HASH)
+                except Exception:
+                    seen = False
+                self._json({"reachable": seen, "seen_as": who})
             elif self.path == "/chain":
                 with node.lock:
                     self._json(chain_to_list(node.chain))
             elif self.path == "/state":
                 with node.lock:
                     self._json({"registry": node.registry, "log": node.confirmed_log,
-                                "url": node.my_url})
+                                "url": node.public_url or node.my_url})
             elif self.path == "/info":
                 with node.lock:
                     self._json({"blocks": len(node.chain.chain),
                                 "confirmed": len(node.confirmed),
-                                "last_hash": node.chain.last_block.compute_hash()})
+                                "last_hash": node.chain.last_block.compute_hash(),
+                                "protocol": PROTOCOL_VERSION,
+                                "version": NODE_VERSION,
+                                "genesis": _CANONICAL_GENESIS_HASH})
+            elif self.path == "/network":
+                # Compact public summary for the live mint page. Small and cheap
+                # to serve no matter how long the chain gets -- the page must
+                # never have to pull the whole chain just to show activity.
+                with node.lock:
+                    blocks = list(node.chain.chain)
+                    minted = total_minted(node.chain)
+                earned = {}
+                won = {}
+                for b in blocks[1:]:
+                    for tx in b.transactions:
+                        if isinstance(tx, dict) and tx.get("type") == "reward":
+                            a = tx.get("to")
+                            earned[a] = round(earned.get(a, 0.0) + tx.get("amount", 0.0), 8)
+                            won[a] = won.get(a, 0) + 1
+                recent = []
+                for b in blocks[-15:][::-1]:
+                    if b.index == 0:
+                        continue
+                    paid = [tx for tx in b.transactions
+                            if isinstance(tx, dict) and tx.get("type") == "reward"]
+                    recent.append({"h": b.index, "t": b.timestamp, "miners": len(paid),
+                                   "paid": round(sum(tx.get("amount", 0.0) for tx in paid), 8)})
+                active = []
+                if len(blocks) > 1:
+                    active = sorted({tx.get("to") for tx in blocks[-1].transactions
+                                     if isinstance(tx, dict) and tx.get("type") == "reward"})
+                roll = sorted(({"a": a, "n": n, "blocks": won.get(a, 0)}
+                               for a, n in earned.items()),
+                              key=lambda r: -r["n"])[:25]
+                self._json({"blocks": len(blocks), "minted": round(minted, 8),
+                            "max_supply": MAX_SUPPLY, "miners": len(earned),
+                            "active": active, "recent": recent, "roll": roll,
+                            "protocol": PROTOCOL_VERSION, "version": NODE_VERSION})
+
+            elif self.path.startswith("/block"):
+                # One block in full, so anyone can browse the chain like any
+                # other public ledger rather than take our word for it.
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                want_hash = (q.get("hash", [""])[0] or "").strip().lower()
+                try:
+                    h = int(q.get("h", ["-1"])[0])
+                except ValueError:
+                    h = -1
+                with node.lock:
+                    chain = node.chain.chain
+                    if want_hash:
+                        h = next((b.index for b in chain
+                                  if b.compute_hash().lower() == want_hash), -1)
+                    if h < 0 or h >= len(chain):
+                        self._json({"error": "no such block"}, 404); return
+                    b = chain[h]
+                    targets = compute_targets(chain)
+                    target = targets[h] if h < len(targets) else MAX_TARGET
+                    rewards = [t for t in b.transactions
+                               if isinstance(t, dict) and t.get("type") == "reward"]
+                    shares = [t for t in b.transactions
+                              if isinstance(t, dict) and t.get("type") == "shares"]
+                    share_list = shares[0].get("list", []) if shares else []
+                    per_miner = {}
+                    for s in share_list:
+                        if isinstance(s, dict):
+                            a = s.get("address")
+                            per_miner[a] = per_miner.get(a, 0) + 1
+                    self._json({
+                        "height": b.index,
+                        "hash": b.compute_hash(),
+                        "pow_hash": b.pow_hash(),
+                        "previous_hash": b.previous_hash,
+                        "timestamp": b.timestamp,
+                        "nonce": b.nonce,
+                        "tx_hash": b.tx_hash,
+                        "transactions": len(b.transactions),
+                        "reward": round(sum(t.get("amount", 0) for t in rewards), 8),
+                        "work_shares": len(share_list),
+                        "shares_by": [{"address": a, "count": c}
+                                      for a, c in sorted(per_miner.items(),
+                                                         key=lambda kv: -kv[1])],
+                        "difficulty_bits": (256 - target.bit_length() + 1) if target else 0,
+                        "target": hex(target),
+                        "paid": [{"to": t.get("to"), "amount": t.get("amount")}
+                                 for t in rewards],
+                        "raw": b.transactions,
+                        "height_of_tip": len(chain) - 1,
+                    })
+
+            elif self.path.startswith("/transfers"):
+                # Transfers never enter a block: they are agreed by stake-weighted
+                # vote. Without this the whole payment side of the ledger would be
+                # invisible to anyone browsing.
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                sig_want = (q.get("sig", [""])[0] or "").strip()
+                with node.lock:
+                    balances = node.get_balances()
+                    out = []
+                    for entry in reversed(node.confirmed_log[-200:]):
+                        tx = entry.get("tx", {})
+                        sig = tx.get("signature", "")
+                        if sig_want and not sig.startswith(sig_want):
+                            continue
+                        votes = entry.get("votes", {})
+                        yes = sum(max(balances.get(a, 0), 0.0)
+                                  for a, v in votes.items() if v.get("approve"))
+                        no = sum(max(balances.get(a, 0), 0.0)
+                                 for a, v in votes.items() if not v.get("approve"))
+                        out.append({
+                            "signature": sig,
+                            "from": tx.get("from"), "to": tx.get("to"),
+                            "amount": tx.get("amount"), "timestamp": tx.get("timestamp"),
+                            "voters": len(votes),
+                            "weight_yes": round(yes, 8), "weight_no": round(no, 8),
+                            "votes": [{"validator": a, "approve": bool(v.get("approve")),
+                                       "weight": round(max(balances.get(a, 0), 0.0), 8)}
+                                      for a, v in sorted(votes.items())],
+                        })
+                        if len(out) >= (1 if sig_want else 40):
+                            break
+                    pending = [{"from": t.get("from"), "to": t.get("to"),
+                                "amount": t.get("amount"), "signature": s}
+                               for s, t in node.transfers.items()
+                               if s not in node.confirmed][:20]
+                self._json({"confirmed": out, "pending": pending})
+
+            elif self.path.startswith("/holders"):
+                with node.lock:
+                    balances = node.get_balances()
+                    total = sum(max(b, 0.0) for b in balances.values())
+                    rows = sorted(((a, b) for a, b in balances.items() if b > 0),
+                                  key=lambda kv: -kv[1])[:200]
+                self._json({"total": round(total, 8), "count": len(balances),
+                            "holders": [{"address": a, "balance": round(b, 8),
+                                         "share": round(100 * b / total, 4) if total else 0}
+                                        for a, b in rows]})
+
+            elif self.path.startswith("/address"):
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                a = (q.get("a", [""])[0] or "").strip()
+                if not a.startswith("SOSA"):
+                    self._json({"error": "not a SOSA address"}, 400); return
+                with node.lock:
+                    mined, blocks_paid, first, last = 0.0, 0, None, None
+                    for b in node.chain.chain:
+                        got = sum(t.get("amount", 0) for t in b.transactions
+                                  if isinstance(t, dict) and t.get("type") == "reward"
+                                  and t.get("to") == a)
+                        if got:
+                            mined += got
+                            blocks_paid += 1
+                            first = b.index if first is None else first
+                            last = b.index
+                    moves = []
+                    for entry in node.confirmed_log[-400:]:
+                        tx = entry.get("tx", {})
+                        if tx.get("from") == a or tx.get("to") == a:
+                            moves.append({"dir": "out" if tx.get("from") == a else "in",
+                                          "amount": tx.get("amount"),
+                                          "other": tx.get("to") if tx.get("from") == a
+                                                   else tx.get("from"),
+                                          "t": tx.get("timestamp")})
+                    self._json({
+                        "address": a,
+                        "balance": round(node.get_balances().get(a, 0.0), 8),
+                        "mined": round(mined, 8),
+                        "blocks_paid": blocks_paid,
+                        "first_block": first, "last_block": last,
+                        "transfers": moves[-25:][::-1],
+                    })
             else:
                 self._json({"error": "unknown"}, 404)
 
@@ -1041,6 +1348,14 @@ def sync_transfers(node):
                           for a, v in good_votes.items()
                           if v.get("approve") and a in node.registry)
                 if total > 0 and yes * 2 > total:
+                    # A majority can only ever confirm a transfer that is
+                    # arithmetically possible. Votes decide *ordering and
+                    # agreement*; they can never conjure coins that were never
+                    # mined, so an overdraft is refused no matter who signed it.
+                    bal = balances.get(tx["from"], 0)
+                    spent = node._committed_outgoing(tx["from"], sig)
+                    if bal - spent + 1e-9 < tx["amount"]:
+                        continue
                     node.transfers[sig] = tx
                     node.votes.setdefault(sig, {}).update(good_votes)
                     node.confirmed_log.append({"tx": tx, "votes": good_votes})
@@ -1113,34 +1428,419 @@ HARDCODED_SEEDS = [
 ]
 
 
-def load_seeds(node):
-    urls = []
+def _clean_urls(lines):
+    out = []
+    for ln in lines:
+        ln = ln.strip()
+        if ln and not ln.startswith("#") and ln.startswith("http"):
+            out.append(ln.rstrip("/"))
+    return out
+
+
+_PRIVATE_PREFIXES = ("127.", "10.", "192.168.", "169.254.", "0.", "255.",
+                     "192.0.2.", "198.51.100.", "203.0.113.")
+LEARNED_SEEDS_FILE = "seeds_learned.txt"
+
+
+def is_public_url(url):
+    """
+    Could somebody on the other side of the world reach this address?
+
+    A node's address on its own wifi (192.168.x.x) is perfectly good for
+    talking to the machine next to it and completely useless as a way into the
+    network. Publishing one as a seed just hands newcomers a dead end.
+
+    The subtle one is 100.64-127.x: that means the internet provider has put
+    the customer behind their own layer of NAT, so the address looks public but
+    nothing can ever connect to it. Those must be filtered too, or half the
+    published seeds would be addresses that can never answer.
+    """
+    try:
+        host = urllib.parse.urlparse(url).hostname or ""
+    except Exception:
+        return False
+    if not host or host in ("localhost", "::1"):
+        return False
+    if host.startswith(_PRIVATE_PREFIXES):
+        return False
+    parts = host.split(".")
+    if len(parts) == 4:
+        try:
+            a, b = int(parts[0]), int(parts[1])
+        except ValueError:
+            return True                       # a hostname, not an IP -- allow it
+        if a == 172 and 16 <= b <= 31:        # private range
+            return False
+        if a == 100 and 64 <= b <= 127:       # carrier-grade NAT, never reachable
+            return False
+    return True
+
+
+def good_seeds(node, verify=False, limit=20):
+    """
+    The entry points this node would recommend to a newcomer: public addresses,
+    running our coin, that were actually answering recently.
+    """
+    with node.lock:
+        candidates = [p for p in node.peers if is_public_url(p)]
+        if node.reachable and node.public_url and is_public_url(node.public_url):
+            candidates.append(node.public_url)
+    seen, out = set(), []
+    for url in candidates:
+        u = url.rstrip("/")
+        if u in seen:
+            continue
+        seen.add(u)
+        if verify and not _answers(u, timeout=3):
+            continue
+        out.append(u)
+        if len(out) >= limit:
+            break
+    return sorted(out)
+
+
+def save_learned_seeds(node):
+    """
+    Keep our own list of ways back in, so this node can rejoin later without
+    anyone editing a file. The operator's seeds.txt is never touched -- that
+    one belongs to them, this one belongs to the node.
+    """
+    seeds = good_seeds(node, verify=True)
+    if not seeds:
+        return 0
+    try:
+        with open(LEARNED_SEEDS_FILE, "w") as f:
+            f.write("# Written by the node itself -- addresses that were\n"
+                    "# answering and reachable from the wider internet.\n"
+                    "# Safe to delete; it will be rebuilt.\n")
+            for s in seeds:
+                f.write(s + "\n")
+        return len(seeds)
+    except Exception:
+        return 0
+
+
+def seed_keeper(node):
+    """Refresh the remembered ways in, quietly, for as long as we run."""
+    while True:
+        time.sleep(300)
+        try:
+            save_learned_seeds(node)
+        except Exception:
+            pass
+
+
+def nostr_announce(node):
+    """
+    Publish this node's address to relays nobody here controls.
+
+    Only reachable nodes announce -- publishing an address that cannot accept
+    connections just wastes a newcomer's time.
+    """
+    if node.no_nostr:
+        return 0
+    with node.lock:
+        url = node.public_url if node.reachable else None
+    if not url or not is_public_url(url):
+        return 0
+    try:
+        sk = nostrseed.identity_from(node.wallet.public_key_bytes())
+        return nostrseed.announce(sk, url, _CANONICAL_GENESIS_HASH)
+    except Exception:
+        return 0
+
+
+def nostr_announce_loop(node):
+    """Re-announce now and then, since relays drop old messages."""
+    first = True
+    while True:
+        time.sleep(20 if first else 1800)
+        first = False
+        try:
+            n = nostr_announce(node)
+            if n:
+                add_event(node, f"announced to {n} relay(s)")
+        except Exception:
+            pass
+
+
+def nostr_discover(node, quiet=True):
+    """Ask relays which nodes are out there, and connect to any that answer."""
+    if node.no_nostr:
+        return 0
+    try:
+        urls = nostrseed.discover(_CANONICAL_GENESIS_HASH, timeout=6)
+    except Exception:
+        return 0
+    joined = 0
+    for url in urls:
+        with node.lock:
+            known = url in node.peers
+        if known or url == node.my_url or not is_public_url(url):
+            continue
+        if _answers(url, timeout=4) and meet(node, url):
+            joined += 1
+    if joined and not quiet:
+        print(f"\n  [relays] found {joined} node(s) published on Nostr -- "
+              f"no seed file involved."
+              f"\nsosa:{node.port}> ", end="", flush=True)
+    if joined:
+        add_event(node, f"found {joined} node(s) via relays")
+        save_learned_seeds(node)
+    return joined
+
+
+def nostr_discover_loop(node):
+    """Keep an eye on the relays, so the file never has to be right."""
+    while True:
+        time.sleep(60)
+        try:
+            nostr_discover(node, quiet=False)
+        except Exception:
+            pass
+        time.sleep(840)
+
+
+def _seed_sources(node):
+    """
+    Every way we know of to find the network, gathered rather than chained.
+
+    The old version stopped at the first source that produced *any* address,
+    so a single stale line in seeds.txt would hide the working fallbacks behind
+    it and strand a newcomer. Losing one entry point should never be fatal, so
+    now we collect them all and try the lot.
+
+    Order is by how likely each is to still be right: peers we have actually
+    spoken to, then a file the operator controls, then the published list, then
+    the address baked into this build.
+    """
+    sources = []
+    with node.lock:
+        remembered = sorted(node.peers)
+    if remembered:
+        sources.append(("peers we met before", remembered))
+    if os.path.exists(LEARNED_SEEDS_FILE):
+        try:
+            with open(LEARNED_SEEDS_FILE) as f:
+                found = _clean_urls(f)
+            if found:
+                sources.append(("ways in we found ourselves", found))
+        except Exception:
+            pass
     if os.path.exists("seeds.txt"):
         try:
             with open("seeds.txt") as f:
-                urls = [ln.strip() for ln in f
-                        if ln.strip() and not ln.strip().startswith("#")]
+                found = _clean_urls(f)
+            if found:
+                sources.append(("seeds.txt", found))
         except Exception:
             pass
-    source = "seeds.txt"
-    if not urls:
+    try:
+        with urllib.request.urlopen(DEFAULT_SEEDS_URL, timeout=4) as r:
+            found = _clean_urls(r.read().decode(errors="ignore").splitlines())
+        if found:
+            sources.append(("the published list", found))
+    except Exception:
+        pass
+    if HARDCODED_SEEDS:
+        sources.append(("the address built into this app", _clean_urls(HARDCODED_SEEDS)))
+    return sources
+
+
+def _answers(url, timeout=4):
+    """Is anything actually there, and is it the same coin as us?"""
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/info", timeout=timeout) as r:
+            info = loads_strict(r.read())
+    except Exception:
+        return False
+    if not isinstance(info, dict):
+        return False
+    genesis = info.get("genesis")
+    # older builds do not report a genesis; give them the benefit of the doubt
+    return genesis is None or genesis == _CANONICAL_GENESIS_HASH
+
+
+def load_seeds(node):
+    tried, live, worked = set(), 0, []
+    for label, urls in _seed_sources(node):
+        hits = 0
+        for url in urls:
+            if url in tried or url == node.my_url or len(tried) >= 25:
+                continue
+            tried.add(url)
+            if not _answers(url):
+                continue
+            hits += 1
+            live += 1
+            meet(node, url)
+        if hits:
+            worked.append(f"{hits} from {label}")
+        if live >= 5:            # a handful of good ways in is plenty
+            break
+
+    if live:
+        print(f"  Joined the network via {live} node(s): {', '.join(worked)}.")
+        add_event(node, f"bootstrapped via {live} node(s)")
+        # One live node is enough to learn about all the others. This is what
+        # stops the network depending on whichever address happened to be
+        # baked into the download.
+        learned = 0
+        for peer in list(node.peers)[:3]:
+            data = get_json(peer.rstrip("/") + "/seeds")
+            if not isinstance(data, dict):
+                continue
+            for url in data.get("seeds", [])[:20]:
+                if (isinstance(url, str) and url not in tried
+                        and is_public_url(url) and url != node.my_url):
+                    tried.add(url)
+                    if meet(node, url):
+                        learned += 1
+        if learned:
+            print(f"  Learned {learned} more way(s) in from the network itself.")
+        save_learned_seeds(node)
+        return True
+
+    if not tried:
+        print("  No way in is configured. Asking the public relays\u2026")
+    else:
+        print(f"  Tried {len(tried)} known address(es) and none answered.")
+        print("  Asking the public relays instead\u2026")
+    if nostr_discover(node):
+        with node.lock:
+            n = len(node.peers)
+        print(f"  Joined via the relays -- {n} node(s), no seed file needed.")
+        save_learned_seeds(node)
+        return True
+    print("  Nothing answered there either. Either everything is offline")
+    print("  or this computer has no internet. Mining still works -- you")
+    print("  will just be building on your own. It retries by itself.")
+    add_event(node, "found no way into the network yet")
+    return False
+
+
+def retry_bootstrap(node):
+    """
+    Keep looking for a way in, so a node that started while every entry point
+    was down still joins later without anyone restarting it.
+    """
+    delay = 30
+    while True:
+        time.sleep(delay)
+        with node.lock:
+            alone = not node.peers
+        if not alone:
+            delay = 30
+            continue
+        if load_seeds(node):
+            return
+        delay = min(delay * 2, 600)      # back off, but never give up
+
+
+def check_peer_rules(node, peer):
+    """
+    Ask a peer which rules it plays by and say something if they differ.
+
+    We warn rather than refuse. Cutting off a peer over a version number would
+    cause exactly the split we are trying to avoid -- and during an upgrade the
+    two sides genuinely do need to keep talking. What matters is that the
+    disagreement is visible to a human instead of silently forking the chain.
+    """
+    info = get_json(peer.rstrip("/") + "/info")
+    if not isinstance(info, dict):
+        return
+    with node.lock:
+        if peer in node.warned_peers:
+            return
+    theirs = info.get("protocol")
+    genesis = info.get("genesis")
+
+    trouble = None
+    if genesis and genesis != _CANONICAL_GENESIS_HASH:
+        trouble = ("a DIFFERENT GENESIS BLOCK -- this is a separate coin, not a "
+                   "different version of ours. Nothing will ever sync between us.")
+    elif theirs is None:
+        trouble = ("a build too old to say which rules it follows. It may not "
+                   "understand blocks we consider valid.")
+    elif theirs != PROTOCOL_VERSION:
+        trouble = (f"consensus rules v{theirs}, and we follow v{PROTOCOL_VERSION}. "
+                   "One of us is out of date; until that is fixed the two sides "
+                   "can drift onto different chains.")
+    if not trouble:
+        return
+    with node.lock:
+        node.warned_peers.add(peer)
+    print(f"\n  [!] {peer} is running {trouble}"
+          f"\n      Get the current build from https://sosaiem.com"
+          f"\nsosa:{node.port}> ", end="", flush=True)
+    add_event(node, f"peer {peer} runs different rules")
+
+
+def confirm_reachable(node):
+    """
+    Ask peers whether they can actually reach us, and believe them over
+    ourselves. A node that merely *thinks* it is reachable poisons everyone
+    else's peer list with an address that never answers.
+    """
+    for peer in list(node.peers)[:6]:
         try:
-            with urllib.request.urlopen(DEFAULT_SEEDS_URL, timeout=4) as r:
-                urls = [ln.strip() for ln in r.read().decode(errors="ignore").splitlines()
-                        if ln.strip() and not ln.strip().startswith("#")]
-            source = "the web"
+            data = get_json(peer.rstrip("/") + f"/reachme?port={node.port}")
         except Exception:
-            urls = []
-    if not urls:
-        urls = list(HARDCODED_SEEDS)      # always-available fallback
-        source = "built-in seed"
-    count = 0
-    for url in urls[:10]:
-        if url.startswith("http") and meet(node, url):
-            count += 1
-    if count:
-        print(f"  Joined the network via {count} seed node(s) from {source}.")
-        add_event(node, f"bootstrapped via {count} seed(s) from {source}")
+            continue
+        if not isinstance(data, dict):
+            continue
+        if data.get("reachable"):
+            seen_as = data.get("seen_as")
+            with node.lock:
+                node.reachable = True
+                if seen_as:
+                    node.public_url = f"http://{seen_as}:{node.port}"
+            return True
+    with node.lock:
+        node.reachable = False
+    return False
+
+
+def open_the_door(node):
+    """
+    Try to become a node other people can join through.
+
+    This runs in the background at start-up: ask the router to forward our
+    port, then get a peer to confirm it worked. Every node that succeeds is one
+    less reason for the whole network to depend on a single server.
+    """
+    if node.no_upnp:
+        return
+    ok, detail = (False, "skipped")
+    try:
+        ok, detail = portmap.open_port(node.port)
+    except Exception as e:
+        ok, detail = False, f"{type(e).__name__}"
+    if ok:
+        node.upnp_opened = True
+        print(f"\n  [door] {detail} opened port {node.port} for this computer."
+              f"\n         Other people can now join the network through you."
+              f"\n         Run with --no-upnp if you would rather it did not."
+              f"\nsosa:{node.port}> ", end="", flush=True)
+        add_event(node, f"router opened port {node.port}")
+    # confirm with an actual peer either way -- some people already forward ports
+    for _ in range(3):
+        time.sleep(4)
+        if not node.peers:
+            continue
+        if confirm_reachable(node):
+            with node.lock:
+                url = node.public_url
+            print(f"\n  [door] confirmed: the network can reach you at {url}."
+                  f"\n         You are now one of the ways in for newcomers."
+                  f"\nsosa:{node.port}> ", end="", flush=True)
+            add_event(node, "confirmed reachable from the internet")
+            return
+    if not ok:
+        print(f"\n  [door] could not open a port ({detail})."
+              f"\n         Mining and sending still work normally -- you just"
+              f"\n         cannot host newcomers. That is very common at home."
+              f"\nsosa:{node.port}> ", end="", flush=True)
 
 
 def meet(node, peer):
@@ -1149,6 +1849,7 @@ def meet(node, peer):
     node.peers.add(peer)
     node.save_peers()
     introduce_self(node, peer)
+    threading.Thread(target=check_peer_rules, args=(node, peer), daemon=True).start()
     threading.Thread(target=sync, args=(node,), daemon=True).start()
     return True
 
@@ -1194,8 +1895,10 @@ def discovery_listener(node):
 
 
 def _mine_one_block_racing(node):
-    B_SHARE = 4000
-    B_BLOCK = 4000
+    # each attempt now costs about 22ms, so batches are small enough that the
+    # miner still notices a new block arriving within a second or so
+    B_SHARE = 12
+    B_BLOCK = 12
 
     def build_candidate():
         share_list = [{"address": a, "nonce": n}
@@ -1238,9 +1941,11 @@ def _mine_one_block_racing(node):
         now = time.time()
         if now - last_beat > 15:
             queued = sum(len(v) for v in node.cur_shares["by"].values())
-            rate = hashes_done / max(now - race_start, 0.001) / 1000
+            # memory-hard attempts run in the tens per second, not the thousands,
+            # so kH/s would just read as zero and look broken
+            rate = hashes_done / max(now - race_start, 0.001)
             print(f"   ...still working on block {prev.index + 1} "
-                  f"({int(now - race_start)}s, ~{rate:.0f} kH/s, "
+                  f"({int(now - race_start)}s, ~{rate:.0f} hashes/s, "
                   f"{queued} work-share(s) queued for this block)")
             last_beat = now
 
@@ -1266,7 +1971,7 @@ def _mine_one_block_racing(node):
         found = False
         for _ in range(B_BLOCK):
             candidate.nonce = nb
-            if int(candidate.compute_hash(), 16) < target:
+            if int(candidate.pow_hash(), 16) < target:
                 found = True
                 break
             nb += 1
@@ -1454,6 +2159,7 @@ def main():
         threading.Thread(target=_open_wallet, daemon=True).start()
     print("=" * 66)
     print("  SOSAIEM -- society's coin  (unified node)")
+    print(f"  build {NODE_VERSION}  *  consensus rules v{PROTOCOL_VERSION}")
     print("  mining creates SOSA * stake-voting moves it, feeless * one ledger")
     print("=" * 66)
     node = Node(port)
@@ -1465,6 +2171,13 @@ def main():
     print(f"  Browser wallet:      http://localhost:{port}   (dashboard, send, mine)")
     print("  Other Sosaiem nodes on this machine/wifi will be found automatically.")
     load_seeds(node)
+    node.no_upnp = "--no-upnp" in sys.argv
+    node.no_nostr = "--no-nostr" in sys.argv
+    threading.Thread(target=open_the_door, args=(node,), daemon=True).start()
+    threading.Thread(target=retry_bootstrap, args=(node,), daemon=True).start()
+    threading.Thread(target=seed_keeper, args=(node,), daemon=True).start()
+    threading.Thread(target=nostr_announce_loop, args=(node,), daemon=True).start()
+    threading.Thread(target=nostr_discover_loop, args=(node,), daemon=True).start()
     print(HELP)
     while True:
         try:

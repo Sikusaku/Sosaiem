@@ -20,6 +20,25 @@ def _canonical(tx: dict) -> str:
     return json.dumps(core, sort_keys=True)
 
 
+def amount_is_sane(amt, allow_zero: bool = False) -> bool:
+    """
+    The one place an amount is judged. An amount must be a real, finite,
+    non-negative number inside the supply cap.
+
+    JSON can carry NaN and Infinity, and NaN compares False against everything.
+    One NaN in the ledger therefore slips past the supply cap, the reward check
+    and the balance check alike, and poisons the arithmetic for good. Booleans
+    are excluded too: True == 1 in Python, and a flag is not money.
+    """
+    if isinstance(amt, bool) or not isinstance(amt, (int, float)):
+        return False
+    if amt != amt or amt in (float("inf"), float("-inf")):   # NaN / +-Inf
+        return False
+    if amt < 0 or (amt == 0 and not allow_zero):
+        return False
+    return amt <= MAX_SUPPLY
+
+
 def _address_from_pubkey(pubkey_hex: str) -> str:
     digest = hashlib.sha256(bytes.fromhex(pubkey_hex)).hexdigest()
     return "SOSA" + digest[:40]
@@ -49,13 +68,28 @@ def make_reward(recipient_address: str, amount: float) -> dict:
 
 
 def transfer_is_valid(tx: dict) -> bool:
+    if not isinstance(tx, dict):
+        return False
     if tx.get("type") == "reward":
-        return True
+        return amount_is_sane(tx.get("amount"), allow_zero=True)
     if tx.get("type") != "transfer":
         return False
-    if tx["from"] != _address_from_pubkey(tx["from_pubkey"]):
+    # every field must be present and the right shape -- a missing key used to
+    # raise KeyError straight out of the request handler
+    frm, pub = tx.get("from"), tx.get("from_pubkey")
+    to, sig = tx.get("to"), tx.get("signature")
+    if not all(isinstance(v, str) for v in (frm, pub, to, sig)):
         return False
-    return verify_signature(tx["from_pubkey"], _canonical(tx), tx["signature"])
+    if not frm.startswith("SOSA") or not to.startswith("SOSA"):
+        return False
+    if not amount_is_sane(tx.get("amount")):
+        return False
+    try:
+        if frm != _address_from_pubkey(pub):
+            return False
+        return verify_signature(pub, _canonical(tx), sig)
+    except Exception:
+        return False
 
 
 def compute_balances(chain: Blockchain) -> dict:

@@ -1,5 +1,6 @@
 """Sosaiem Wallet -- create your address, hold SOSA, send it. Native window, no browser."""
 
+import os
 import sys
 import threading
 import webbrowser
@@ -10,6 +11,7 @@ except Exception:
     tk = None
 
 import sosaiem_node as core
+from wallet import Wallet
 
 PLATE = "#0b1712"
 PANEL = "#122420"
@@ -101,11 +103,57 @@ class WalletApp:
         self.status = tk.Label(root, text="starting\u2026", bg=PLATE, fg=SAGE,
                                font=("Consolas", 8), anchor="w")
         self.status.pack(fill="x", padx=22)
-        tk.Label(root, text=f"Back up {node.wallet_file} \u2014 that file IS your coins.",
-                 bg=PLATE, fg=RED, font=("Georgia", 9, "italic")).pack(pady=(4, 12))
+
+        backup = tk.Frame(root, bg=PLATE)
+        backup.pack(fill="x", padx=22, pady=(6, 12))
+        if node.wallet.has_phrase():
+            tk.Button(backup, text="Show recovery phrase", command=self.show_phrase,
+                      bg=PANEL, fg=GILT, relief="flat", font=("Consolas", 9),
+                      cursor="hand2").pack(side="left")
+            tk.Label(backup, text="  write the words down \u2014 they are the only way back",
+                     bg=PLATE, fg=DIM, font=("Georgia", 9, "italic")).pack(side="left")
+        else:
+            tk.Label(backup, text=f"No recovery phrase \u2014 back up {node.wallet_file}, "
+                                  "that file IS your coins.",
+                     bg=PLATE, fg=RED, font=("Georgia", 9, "italic")).pack(side="left")
 
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.refresh()
+
+    def show_phrase(self):
+        phrase = self.node.wallet.phrase
+        if not phrase:
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Recovery phrase")
+        win.configure(bg=PLATE)
+        win.resizable(False, False)
+        tk.Label(win, text="YOUR RECOVERY PHRASE", bg=PLATE, fg=GILT,
+                 font=("Consolas", 10)).pack(padx=26, pady=(20, 4))
+        tk.Label(win, text="Write these 17 words on paper, in order, and keep them somewhere\n"
+                           "safe. They rebuild this wallet on any computer.\n"
+                           "Anyone who reads them can take your coins \u2014 never type them\n"
+                           "into a website and never photograph them.",
+                 bg=PLATE, fg=DIM, font=("Georgia", 9), justify="left").pack(padx=26)
+        box = tk.Frame(win, bg=PANEL)
+        box.pack(padx=26, pady=14, fill="x")
+        words = phrase.split()
+        for r in range(0, len(words), 4):
+            line = tk.Frame(box, bg=PANEL)
+            line.pack(anchor="w", padx=14, pady=3)
+            for i, w in enumerate(words[r:r + 4], start=r + 1):
+                tk.Label(line, text=f"{i:2}. {w:<8}", bg=PANEL, fg=PAPER,
+                         font=("Consolas", 11)).pack(side="left")
+
+        def copy():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(phrase)
+            msg.config(text="copied \u2014 paste it somewhere safe, then clear your clipboard")
+
+        tk.Button(win, text="Copy words", command=copy, bg=PANEL, fg=GILT,
+                  relief="flat", font=("Consolas", 9), cursor="hand2").pack()
+        msg = tk.Label(win, text="", bg=PLATE, fg=SAGE, font=("Consolas", 8))
+        msg.pack(pady=(6, 18))
 
     def copy_addr(self):
         self.root.clipboard_clear()
@@ -159,6 +207,57 @@ class WalletApp:
         self.root.destroy()
 
 
+def ask_restore(port):
+    """
+    On a machine with no wallet yet, offer the way back in before we make a new
+    one. This is the moment a person who lost a laptop actually arrives at, so
+    it has to be here rather than buried in a menu.
+    """
+    wallet_file = f"wallet_{port}.pem"
+    if os.path.exists(wallet_file):
+        return
+    win = tk.Tk()
+    win.title("Sosaiem")
+    win.configure(bg=PLATE)
+    win.resizable(False, False)
+    tk.Label(win, text="SOSAIEM", bg=PLATE, fg=GILT,
+             font=("Georgia", 20)).pack(padx=34, pady=(24, 2))
+    tk.Label(win, text="There is no wallet on this computer yet.",
+             bg=PLATE, fg=PAPER, font=SERIF).pack(padx=34)
+    tk.Label(win, text="If you already have a wallet elsewhere, type its 17 recovery\n"
+                       "words below to bring it back. Otherwise make a fresh one.",
+             bg=PLATE, fg=DIM, font=("Georgia", 9), justify="left").pack(padx=34, pady=(6, 12))
+    entry = tk.Text(win, bg=PANEL, fg=PAPER, font=("Consolas", 10),
+                    relief="flat", height=3, width=52, wrap="word")
+    entry.pack(padx=34)
+    msg = tk.Label(win, text="", bg=PLATE, fg=RED, font=("Consolas", 8), wraplength=380)
+    msg.pack(padx=34, pady=(6, 0))
+    row = tk.Frame(win, bg=PLATE)
+    row.pack(padx=34, pady=(10, 24))
+
+    def restore():
+        text = entry.get("1.0", "end").strip()
+        if not text:
+            msg.config(text="type your 17 words first")
+            return
+        try:
+            w = Wallet.from_phrase(text)
+            w.save_to_file(wallet_file)
+        except Exception as e:
+            msg.config(text=str(e))
+            return
+        win.destroy()
+
+    def fresh():
+        win.destroy()
+
+    tk.Button(row, text="Restore this wallet", command=restore, bg=PANEL, fg=GILT,
+              relief="flat", font=MONO, cursor="hand2").pack(side="left", padx=(0, 10))
+    tk.Button(row, text="Make a new wallet", command=fresh, bg=PANEL, fg=DIM,
+              relief="flat", font=MONO, cursor="hand2").pack(side="left")
+    win.mainloop()
+
+
 def main():
     if tk is None:
         print("tkinter is missing. Install Python from python.org (it includes it).")
@@ -167,6 +266,7 @@ def main():
     for arg in sys.argv[1:]:
         if arg.isdigit():
             port = int(arg)
+    ask_restore(port)
     node = start_node(port)
     root = tk.Tk()
     WalletApp(root, node)
