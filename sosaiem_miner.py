@@ -165,7 +165,15 @@ class MinerApp:
 
     def close(self):
         self.node.mining = False
+        try:
+            if getattr(self.node, "server", None):
+                self.node.server.shutdown()
+                self.node.server.server_close()
+        except Exception:
+            pass
         self.root.destroy()
+        import os
+        os._exit(0)
 
 
 def main():

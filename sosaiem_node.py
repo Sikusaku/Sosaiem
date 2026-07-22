@@ -14,7 +14,15 @@ import urllib.request
 
 import portmap
 import nostrseed
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as _BaseHTTPServer
+
+
+class ThreadingHTTPServer(_BaseHTTPServer):
+    # Set at class level so it takes effect *before* the socket binds. This is
+    # what frees the port the moment the app closes; without it Windows holds
+    # the port for a minute or two and reopening the wallet fails to start.
+    allow_reuse_address = True
+    daemon_threads = True
 
 from wallet import Wallet, verify_signature
 from blockchain import (Blockchain, Block, next_target, compute_targets,
@@ -41,7 +49,7 @@ SYNC_INTERVAL = 3
 # window, faster syncing, bug fixes that only tighten what was already invalid.
 # Nobody has to agree on it and nothing can split over it.
 PROTOCOL_VERSION = 2
-NODE_VERSION = "2.0.0"
+NODE_VERSION = "2.0.1"
 DISCOVERY_PORT = 54546
 DISCOVERY_INTERVAL = 4
 
@@ -1105,7 +1113,11 @@ def make_handler(node):
 
 
 def start_server(node):
+    # allow_reuse_address (set on the class above) means the port is free the
+    # instant the app closes, so reopening the wallet does not hit a still-held
+    # socket -- which is what made it look like it only opened once.
     server = ThreadingHTTPServer(("0.0.0.0", node.port), make_handler(node))
+    node.server = server
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"  Server listening on port {node.port}.")
     return server

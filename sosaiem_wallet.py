@@ -204,7 +204,17 @@ class WalletApp:
 
     def close(self):
         self.node.mining = False
+        # actually release the port and stop background threads, otherwise the
+        # node lingers after the window closes and blocks the next launch
+        try:
+            if getattr(self.node, "server", None):
+                self.node.server.shutdown()
+                self.node.server.server_close()
+        except Exception:
+            pass
         self.root.destroy()
+        import os
+        os._exit(0)
 
 
 def ask_restore(port):
