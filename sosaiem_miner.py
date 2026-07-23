@@ -25,13 +25,18 @@ PAYOUT_FILE = "miner_payout.txt"
 
 
 def start_node(port):
+    # Node + port only. Network threads start after the window is up (main()),
+    # so the GUI always draws even when a saved chain needs re-checking.
     node = core.Node(port)
     core.start_server(node)
+    return node
+
+
+def start_node_network(node):
     threading.Thread(target=core.auto_sync_loop, args=(node,), daemon=True).start()
     threading.Thread(target=core.discovery_beacon, args=(node,), daemon=True).start()
     threading.Thread(target=core.discovery_listener, args=(node,), daemon=True).start()
-    core.load_seeds(node)
-    return node
+    threading.Thread(target=core.load_seeds, args=(node,), daemon=True).start()
 
 
 def valid_address(a):
@@ -177,6 +182,7 @@ class MinerApp:
 
 
 def main():
+    core._unfreeze_windows_console()
     if tk is None:
         print("tkinter is missing. Install Python from python.org (it includes it).")
         return
@@ -187,6 +193,7 @@ def main():
     node = start_node(port)
     root = tk.Tk()
     MinerApp(root, node)
+    root.after(1500, lambda: start_node_network(node))
     root.mainloop()
 
 

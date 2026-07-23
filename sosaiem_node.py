@@ -17,12 +17,67 @@ import nostrseed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as _BaseHTTPServer
 
 
+from concurrent.futures import ThreadPoolExecutor
+
+
 class ThreadingHTTPServer(_BaseHTTPServer):
     # Set at class level so it takes effect *before* the socket binds. This is
     # what frees the port the moment the app closes; without it Windows holds
     # the port for a minute or two and reopening the wallet fails to start.
     allow_reuse_address = True
     daemon_threads = True
+
+    # A public node gets hammered by random internet traffic. Spawning one
+    # unbounded thread per request piled up until the OS refused new threads
+    # ("can't start new thread") and the whole node stopped answering. A fixed
+    # pool caps concurrency: requests queue instead of exhausting the machine.
+    _pool = None
+
+    def process_request(self, request, client_address):
+        if self._pool is None:
+            type(self)._pool = ThreadPoolExecutor(max_workers=16,
+                                                  thread_name_prefix="sos-http")
+        self._pool.submit(self._handle_pooled, request, client_address)
+
+    def _handle_pooled(self, request, client_address):
+        try:
+            self.finish_request(request, client_address)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.shutdown_request(request)
+            except Exception:
+                pass
+
+def _unfreeze_windows_console():
+    """
+    Stop Windows pausing the whole program when someone clicks in the window.
+
+    Command Prompt ships with "QuickEdit Mode" on. Clicking anywhere inside the
+    console -- even by accident, even once -- suspends the entire process until
+    a key is pressed. Nothing says so. The node simply stops: it stops syncing,
+    stops answering, and quietly falls further and further behind, still showing
+    its last state as though it were working. Press Enter and it springs back to
+    life and catches up in one jump, which looks like a mysterious stall that
+    mysteriously healed. It was never a stall; the program was frozen.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        handle = k.GetStdHandle(-10)          # STD_INPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not k.GetConsoleMode(handle, ctypes.byref(mode)):
+            return
+        ENABLE_QUICK_EDIT = 0x0040
+        ENABLE_EXTENDED_FLAGS = 0x0080
+        k.SetConsoleMode(handle,
+                         (mode.value & ~ENABLE_QUICK_EDIT) | ENABLE_EXTENDED_FLAGS)
+    except Exception:
+        pass
+
 
 from wallet import Wallet, verify_signature
 from blockchain import (Blockchain, Block, next_target, compute_targets,
@@ -49,7 +104,16 @@ SYNC_INTERVAL = 3
 # window, faster syncing, bug fixes that only tighten what was already invalid.
 # Nobody has to agree on it and nothing can split over it.
 PROTOCOL_VERSION = 2
-NODE_VERSION = "2.0.1"
+NODE_VERSION = "2.7.0"
+
+# Blocks may carry a small tag naming the build that made them. It is accepted
+# and recorded, never required. A rule that forces everyone onto a particular
+# build is a rule somebody had to choose, and choosing the activation height
+# wrongly invalidates real work -- which is exactly what happened when it was
+# set at block 400 while honest miners were already past it. Adoption does the
+# same job on its own: whoever runs current software keeps up.
+BUILD_MARKER = 220
+
 DISCOVERY_PORT = 54546
 DISCOVERY_INTERVAL = 4
 
@@ -139,6 +203,31 @@ def get_lan_ip():
         return "127.0.0.1"
 
 
+_chain_cache = {"tip": None, "body": b"[]"}
+_chain_cache_lock = threading.Lock()
+
+
+def _cached_chain_payload(node):
+    """
+    The chain as JSON bytes, re-encoded only when a new block arrives.
+
+    Everything that syncs asks for this, so it is by far the hottest thing the
+    node serves. Encoding it per request -- while holding the node's main lock
+    -- was enough on its own to make a busy seed stop answering.
+    """
+    with node.lock:
+        tip = node.chain.last_block.compute_hash()
+        need = _chain_cache["tip"] != tip
+        blocks = chain_to_list(node.chain) if need else None
+    if not need:
+        return _chain_cache["body"]
+    body = json.dumps(blocks).encode()
+    with _chain_cache_lock:
+        _chain_cache["tip"] = tip
+        _chain_cache["body"] = body
+    return body
+
+
 def chain_to_list(chain):
     return [{"index": b.index, "timestamp": b.timestamp, "transactions": b.transactions,
              "previous_hash": b.previous_hash, "nonce": b.nonce} for b in chain.chain]
@@ -157,9 +246,10 @@ def block_to_dict(block):
             "previous_hash": block.previous_hash, "nonce": block.nonce}
 
 
-def _check_block_content(transactions, prev_hash, share_target):
+def _check_block_content(transactions, prev_hash, share_target, height=None):
     shares_entries = []
     rewards = []
+    has_version_tag = False
     for tx in transactions:
         if not isinstance(tx, dict):
             return False, 0.0
@@ -172,8 +262,12 @@ def _check_block_content(transactions, prev_hash, share_target):
             if not isinstance(tx.get("to"), str) or not tx["to"].startswith("SOSA"):
                 return False, 0.0
             rewards.append(tx)
+        elif t == "version":
+            if tx.get("v", 0) >= 1:
+                has_version_tag = True
         else:
             return False, 0.0
+
     if len(shares_entries) > 1:
         return False, 0.0
 
@@ -223,7 +317,14 @@ def _check_block_content(transactions, prev_hash, share_target):
 # checks below still run on every block every time, so a tampered old block
 # still breaks the links and gets caught.
 _verified_work = set()
-_VERIFIED_CAP = 200000
+
+# Only one background verification may run at a time, and it only looks at the
+# most recent blocks. Older ones were checked when they arrived and now sit
+# under a pile of later work; re-hashing them forever bought nothing and cost
+# the miner most of its speed.
+_verify_gate = threading.Semaphore(1)
+VERIFY_DEPTH = 120
+_VERIFIED_CAP = 20000
 
 
 def _remember_verified(block_id):
@@ -253,7 +354,8 @@ def validate_full_chain(chain):
                     minted += tx.get("amount", 0.0)
             continue
         ok, block_reward = _check_block_content(
-            block.transactions, block.previous_hash, share_target_for(targets[block.index]))
+            block.transactions, block.previous_hash,
+            share_target_for(targets[block.index]), height=block.index)
         if not ok:
             return False
         if block_reward > BLOCK_REWARD + 1e-6:
@@ -274,7 +376,8 @@ def validate_new_block(chain, block):
     if int(block.pow_hash(), 16) >= target:
         return False
     ok, block_reward = _check_block_content(
-        block.transactions, block.previous_hash, share_target_for(target))
+        block.transactions, block.previous_hash, share_target_for(target),
+        height=block.index)
     if not ok:
         return False
     if block_reward > BLOCK_REWARD + 1e-6:
@@ -335,10 +438,27 @@ class Node:
         self.transfers_file = f"transfers_{port}.json"
         self.validators_file = f"validators_{port}.json"
 
+        # These must exist before the loaders below run: _load_chain checks
+        # seed_only, and reading an attribute that did not exist yet threw an
+        # error that a catch-all quietly swallowed -- which silently discarded
+        # a perfectly good 267-block chain and started over from genesis.
+        self.seed_only = False
+        self.no_upnp = False
+        self.no_nostr = False
+
         self.wallet = self._load_or_create_wallet()
+        self._load_verified()
         self.chain = self._load_chain()
         self.peers = self._load_peers()
-        self.lock = threading.Lock()
+        # Re-entrant on purpose. A plain Lock is not: a thread that already
+        # holds it and asks for it again waits for itself, forever. That is
+        # exactly what happened when the mining loop called build_candidate()
+        # from inside a locked section -- the miner froze holding the lock, and
+        # every request and every sync then queued behind it. The node looked
+        # completely dead while using no processor at all. RLock makes taking it
+        # twice on one thread harmless, which removes the whole class of bug
+        # rather than the one instance of it.
+        self.lock = threading.RLock()
 
         self.registry = {self.wallet.address(): {"pubkey": self.wallet.public_key_hex()}}
 
@@ -364,6 +484,11 @@ class Node:
         self.no_nostr = False
 
         self.cur_shares = {"prev": None, "by": {}, "version": 0}
+        self.recent_shares = {}   # tip_hash -> {address: {nonces}} for recent tips
+        self.peer_misses = {}     # peer -> consecutive failed checks
+        # How many cores to mine with. One is left free so the machine stays
+        # usable and the node can still answer the network while mining flat out.
+        self.mine_threads = max(1, (os.cpu_count() or 2) - 1)
         self._load_validators()
         self._load_transfers()
         if self.peers:
@@ -401,13 +526,95 @@ class Node:
         try:
             with open(self.chain_file) as f:
                 chain = list_to_chain(json.load(f))
-            if validate_full_chain(chain):
+            # Links only. This is our own chain, saved after we had already
+            # checked each block as it arrived. Re-running the memory-hard proof
+            # over every block here meant that once a node had a real chain, the
+            # app spent minutes grinding before its window ever appeared -- it
+            # looked like it would only ever open once. Editing the file on disk
+            # still breaks the links and is caught immediately; the proof itself
+            # is re-confirmed near the tip in the background.
+            if chain.chain and chain.chain[0].compute_hash() == _CANONICAL_GENESIS_HASH \
+                    and chain.is_chain_valid(links_only=True):
                 print(f"  Loaded chain: {len(chain.chain)} blocks.")
+                # A seed node trusts the chain it already checked block by block
+                # as it arrived. Re-hashing the whole thing on every start is
+                # what pinned the processor and made it stop answering; every
+                # NEW block is still verified in full when it comes in.
+                if not self.seed_only:
+                    threading.Thread(target=self._verify_chain_background,
+                                     args=(chain,), daemon=True).start()
                 return chain
-        except Exception:
-            pass
+            print("  ! Saved chain did not pass its structure check.")
+        except Exception as e:
+            print(f"  ! Could not read the saved chain: {type(e).__name__}: {e}")
         print("  Saved chain invalid -- starting fresh.")
         return Blockchain()
+
+    def _verify_chain_background(self, chain):
+        """
+        Re-confirm proof-of-work near the tip, one thread at a time.
+
+        Two things made this ruinous before. Every reorg started another one of
+        these, so on a busy network they stacked up -- each grinding memory-hard
+        hashes through the whole chain -- and a miner's speed decayed steadily
+        the longer it ran. And each pass walked all several hundred blocks, so
+        it rarely finished, so it never saved its progress, so the next start
+        did the whole thing again and the app looked frozen.
+
+        Now: only one ever runs, it only looks at recent blocks (older ones were
+        already checked when they arrived, and are buried under later work), and
+        it writes down what it has confirmed as it goes.
+        """
+        if not _verify_gate.acquire(blocking=False):
+            return          # one is already running; a second adds nothing
+        try:
+            blocks = chain.chain
+            targets = compute_targets(blocks)
+            start = max(1, len(blocks) - VERIFY_DEPTH)
+            for i in range(start, len(blocks)):
+                block = blocks[i]
+                bid = block.compute_hash()
+                if bid in _verified_work:
+                    continue
+                target = targets[i] if i < len(targets) else MAX_TARGET
+                ok, _ = _check_block_content(
+                    block.transactions, block.previous_hash,
+                    share_target_for(target), height=block.index)
+                if not ok or int(block.pow_hash(), 16) >= target:
+                    # Do NOT throw the chain away. A background check deciding
+                    # to wipe everything back to genesis is far more damaging
+                    # than whatever it found. Report it and stop; if the chain
+                    # really is bad the network's longer one replaces it.
+                    print(f"  ! Note: block {block.index} did not pass the deep "
+                          f"check on this build. Keeping the chain.")
+                    return
+                _remember_verified(bid)
+                time.sleep(0.25)      # never take priority over mining
+            self._save_verified()
+        except Exception:
+            pass
+        finally:
+            _verify_gate.release()
+
+    def _verified_file(self):
+        return f"verified_{self.port}.json"
+
+    def _save_verified(self):
+        try:
+            with open(self._verified_file(), "w") as f:
+                json.dump(sorted(_verified_work), f)
+        except Exception:
+            pass
+
+    def _load_verified(self):
+        try:
+            if os.path.exists(self._verified_file()):
+                with open(self._verified_file()) as f:
+                    for h in json.load(f):
+                        if isinstance(h, str):
+                            _verified_work.add(h)
+        except Exception:
+            pass
 
     def save_chain(self):
         with open(self.chain_file, "w") as f:
@@ -420,7 +627,15 @@ class Node:
             with open(self.peers_file) as f:
                 saved = set(json.load(f))
             saved.discard(self.my_url)
-            return saved
+            # Throw away other people's home-network addresses. They were saved
+            # before we started filtering them, they can never be reached from
+            # here, and re-dialling two dozen of them on every cycle was quietly
+            # eating most of the processor.
+            keep = {p for p in saved if is_public_url(p)}
+            dropped = len(saved) - len(keep)
+            if dropped:
+                print(f"  Dropped {dropped} unreachable address(es) from the peer list.")
+            return keep
         except Exception:
             return set()
 
@@ -493,6 +708,18 @@ class Node:
     def _ensure_share_height(self):
         tip = self.chain.last_block.compute_hash()
         if self.cur_shares.get("prev") != tip:
+            # A new tip. Keep the previous tip's shares around briefly instead
+            # of discarding them -- shares from slower miners are often still in
+            # flight when a block lands, and dropping them is exactly what let a
+            # single fast miner take every reward. They stay claimable for the
+            # next couple of blocks, then age out.
+            old = self.cur_shares
+            hist = self.recent_shares
+            if old.get("prev") and old.get("by"):
+                hist[old["prev"]] = old["by"]
+                # keep only the last few tips' worth
+                while len(hist) > 3:
+                    hist.pop(next(iter(hist)))
             self.cur_shares = {"prev": tip, "by": {}, "version": 0}
 
     def _add_share(self, address, nonce):
@@ -569,7 +796,7 @@ class Node:
         return newly
 
 
-def post_json(url, obj, timeout=3):
+def post_json(url, obj, timeout=2):
     try:
         data = json.dumps(obj).encode()
         req = urllib.request.Request(url, data=data,
@@ -581,7 +808,7 @@ def post_json(url, obj, timeout=3):
         return None
 
 
-def get_json(url, timeout=5):
+def get_json(url, timeout=3):
     try:
         with urllib.request.urlopen(url, timeout=timeout) as r:
             return loads_strict(r.read())
@@ -589,10 +816,17 @@ def get_json(url, timeout=5):
         return None
 
 
+# A single small pool for all outbound gossip/sync, so bursts of network
+# activity cannot each spawn their own thread and pile up toward the OS limit.
+_out_pool = ThreadPoolExecutor(max_workers=20, thread_name_prefix="sos-out")
+
+
 def gossip(node, path, obj):
     for peer in list(node.peers):
-        threading.Thread(target=post_json, args=(peer.rstrip("/") + path, obj),
-                         daemon=True).start()
+        try:
+            _out_pool.submit(post_json, peer.rstrip("/") + path, obj)
+        except Exception:
+            pass
 
 
 def add_event(node, text):
@@ -770,6 +1004,17 @@ def make_handler(node):
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
                 pass
 
+        def _json_raw(self, body, code=200):
+            """Send already-encoded JSON bytes without re-encoding them."""
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                pass
+
         def _read(self, cap=MAX_BODY_DEFAULT):
             n = int(self.headers.get("Content-Length", 0))
             if n > cap:
@@ -845,8 +1090,13 @@ def make_handler(node):
                     seen = False
                 self._json({"reachable": seen, "seen_as": who})
             elif self.path == "/chain":
-                with node.lock:
-                    self._json(chain_to_list(node.chain))
+                # Serving the chain used to rebuild every block into JSON from
+                # scratch, while holding the node's main lock, on every single
+                # request. With several miners each asking every couple of
+                # seconds that meant the node spent its life re-encoding the
+                # same 700 KB and blocking itself out of its own lock. Encode
+                # once per new block instead and hand out the cached bytes.
+                self._json_raw(_cached_chain_payload(node))
             elif self.path == "/state":
                 with node.lock:
                     self._json({"registry": node.registry, "log": node.confirmed_log,
@@ -981,6 +1231,21 @@ def make_handler(node):
                                for s, t in node.transfers.items()
                                if s not in node.confirmed][:20]
                 self._json({"confirmed": out, "pending": pending})
+
+            elif self.path.startswith("/shares"):
+                # Shares only ever travelled by push before, which quietly broke
+                # the whole point of the coin: a miner behind a home router
+                # cannot be pushed to, so it never received anyone else's work
+                # and every block it won paid only itself. Letting nodes ASK for
+                # shares is what makes the split work for people who cannot host.
+                with node.lock:
+                    node._ensure_share_height()
+                    prev = node.cur_shares["prev"]
+                    out = []
+                    for addr, nonces in node.cur_shares["by"].items():
+                        for nc in list(nonces)[:MAX_SHARES_PER_BLOCK]:
+                            out.append({"address": addr, "nonce": nc})
+                self._json({"prev_hash": prev, "shares": out[:MAX_SHARES_PER_BLOCK]})
 
             elif self.path.startswith("/holders"):
                 with node.lock:
@@ -1130,14 +1395,41 @@ def handle_incoming_share(node, s):
     if not isinstance(addr, str) or not addr.startswith("SOSA") \
             or not isinstance(nonce, int) or not isinstance(prev_hash, str):
         return "ignored"
+
+    # A seed does not mine, so it has no use for shares of its own -- but miners
+    # sitting behind home routers can often only reach each other through it, so
+    # it still has to pass them along or the reward split breaks. Checking each
+    # one costs a memory-hard hash, and with several miners submitting steadily
+    # that was most of this machine's processor. Every miner verifies the shares
+    # it receives, and a block carrying a bad share is rejected outright, so the
+    # check still happens where it counts.
+    if getattr(node, "seed_only", False):
+        gossip(node, "/share", s)
+        return "relayed"
+
     with node.lock:
         node._ensure_share_height()
-        if prev_hash != node.cur_shares["prev"]:
+        # accept a share if it targets the current tip OR one of the last few
+        # tips -- this is what stops a fast miner from erasing everyone else's
+        # work every time they find a block
+        if prev_hash == node.cur_shares["prev"]:
+            bucket = node.cur_shares["by"]
+        elif prev_hash in node.recent_shares:
+            bucket = node.recent_shares[prev_hash]
+        else:
             return "stale"
+        # validate the share's proof against the difficulty it was mined at
         st = share_target_for(next_target(node.chain.chain))
         if int(share_hash(prev_hash, addr, nonce), 16) >= st:
             return "invalid"
-        fresh = node._add_share(addr, nonce)
+        nonces = bucket.setdefault(addr, set())
+        if nonce in nonces:
+            fresh = False
+        else:
+            nonces.add(nonce)
+            if prev_hash == node.cur_shares["prev"]:
+                node.cur_shares["version"] += 1
+            fresh = True
     if fresh:
         gossip(node, "/share", s)
         return "accepted"
@@ -1225,7 +1517,13 @@ def handle_submit_chain(node, data):
         # full validation of same/shorter chains that get pushed constantly
         if len(cand.chain) <= len(node.chain.chain):
             return "kept"
-    if not validate_full_chain(cand):
+    # Structure and links only. Re-hashing every block and every work-share on
+    # each push meant a couple of peers pushing normally could saturate the
+    # machine for good -- and it was happening in sixteen threads at once. The
+    # proof-of-work is confirmed gently in the background after adopting, and a
+    # broken link is still caught right here, immediately.
+    if not (cand.chain and cand.chain[0].compute_hash() == _CANONICAL_GENESIS_HASH
+            and cand.is_chain_valid(links_only=True)):
         return "invalid"
     adopted = False
     with node.lock:
@@ -1236,6 +1534,8 @@ def handle_submit_chain(node, data):
             node._last_push_len = len(cand.chain)
             adopted = True
     if adopted:
+        threading.Thread(target=node._verify_chain_background,
+                         args=(cand,), daemon=True).start()
         print(f"\n  [relay] adopted a pushed chain -> {len(cand.chain)} blocks"
               f"\nsosa:{node.port}> ", end="", flush=True)
         with node.lock:
@@ -1303,13 +1603,67 @@ def handle_incoming_vote(node, vote):
 def sync_chain(node):
     if not node.peers:
         return
+    mine = len(node.chain.chain)
+
+    # Ask who is actually ahead before downloading anything. Pulling the whole
+    # chain from every peer on every cycle -- even when already up to date --
+    # was most of the work this loop did.
+    #
+    # Ask them ALL, and ask them at once. Checking only the first handful meant
+    # that when the peer list was mostly dead addresses, the one reachable node
+    # could simply not get asked: the node then believed nobody was ahead, went
+    # quiet, mined its own private fork, and lost every block of it the moment
+    # it reconnected to the real chain. Peer sets have no order, so "the first
+    # few" is a coin toss. /info is a few bytes; there is no reason to ration it.
+    peers = list(node.peers)
+    ahead = []
+    if peers:
+        # Take answers as they arrive. Waiting on the batch as a whole meant a
+        # few dead addresses could time the operation out and discard replies
+        # that had already come back -- including the only peer that actually
+        # had the chain.
+        futures = {}
+        for p in peers:
+            try:
+                futures[_out_pool.submit(get_json, p.rstrip("/") + "/info", 1.5)] = p
+            except Exception:
+                pass
+        deadline = time.time() + 3
+        for fut, p in futures.items():
+            left = deadline - time.time()
+            if left <= 0:
+                break
+            try:
+                info = fut.result(timeout=left)
+            except Exception:
+                continue
+            if info and isinstance(info.get("blocks"), int) and info["blocks"] >= mine:
+                ahead.append((info["blocks"], p))
+    good = {p for _, p in ahead}
+    for p in peers:
+        if p in good:
+            node.peer_misses.pop(p, None)
+        else:
+            node.peer_misses[p] = node.peer_misses.get(p, 0) + 1
+            if node.peer_misses[p] >= 5 and p not in HARDCODED_SEEDS:
+                node.peers.discard(p)
+                node.peer_misses.pop(p, None)
+    if not ahead:
+        return
+    ahead.sort(reverse=True)
+
     best, source = node.chain, None
-    for peer in list(node.peers):
-        data = get_json(peer.rstrip("/") + "/chain")
+    for _, peer in ahead[:3]:
+        data = get_json(peer.rstrip("/") + "/chain", timeout=12)
         if data is None:
             continue
         cand = list_to_chain(data)
-        if not validate_full_chain(cand):
+        # Links-only here so a slow CPU keeps pace with the network's tip.
+        # Re-hashing every block inline let a slow machine fall permanently
+        # behind. The proof-of-work is confirmed gently in the background after
+        # adopting, and a broken link is still caught instantly right here.
+        if not (cand.chain and cand.chain[0].compute_hash() == _CANONICAL_GENESIS_HASH
+                and cand.is_chain_valid(links_only=True)):
             continue
         if is_better(cand, best):
             best, source = cand, peer
@@ -1325,6 +1679,12 @@ def sync_chain(node):
     if switched:
         print(f"\n  [sync] adopted a better chain from {source} "
               f"-> {len(best.chain)} blocks\nsosa:{node.port}> ", end="", flush=True)
+        # Confirm the proof-of-work off the main thread, gently. This uses the
+        # same throttled verifier as start-up: running it flat out pinned the
+        # only processor and made the node stop answering entirely.
+        if not node.seed_only:
+            threading.Thread(target=node._verify_chain_background,
+                             args=(best,), daemon=True).start()
         with node.lock:
             newly = node.retally()
         for sig in newly:
@@ -1379,14 +1739,66 @@ def sync_transfers(node):
             announce_confirm(node, sig)
 
 
+def pull_shares(node):
+    """
+    Ask peers for the work-shares they have collected.
+
+    Without this a miner that cannot accept incoming connections never learns
+    about anyone else's work, so the blocks it wins pay nobody but itself --
+    which looks exactly like the split being broken, and effectively is.
+    """
+    with node.lock:
+        node._ensure_share_height()
+        tip = node.cur_shares["prev"]
+    if not tip:
+        return
+    st = share_target_for(next_target(node.chain.chain))
+    added = 0
+    for peer in list(node.peers)[:6]:
+        data = get_json(peer.rstrip("/") + "/shares", timeout=3)
+        if not isinstance(data, dict) or data.get("prev_hash") != tip:
+            continue
+        for item in (data.get("shares") or [])[:MAX_SHARES_PER_BLOCK]:
+            if not isinstance(item, dict):
+                continue
+            addr, nonce = item.get("address"), item.get("nonce")
+            if not isinstance(addr, str) or not addr.startswith("SOSA") \
+                    or not isinstance(nonce, int):
+                continue
+            with node.lock:
+                if node.cur_shares["prev"] != tip:
+                    return
+                bucket = node.cur_shares["by"].setdefault(addr, set())
+                if nonce in bucket:
+                    continue
+            # only pay for the hash once we know it is new to us
+            if int(share_hash(tip, addr, nonce), 16) >= st:
+                continue
+            with node.lock:
+                if node.cur_shares["prev"] == tip:
+                    node.cur_shares["by"].setdefault(addr, set()).add(nonce)
+                    node.cur_shares["version"] += 1
+                    added += 1
+        if added >= MAX_SHARES_PER_BLOCK:
+            break
+    return added
+
+
 def sync(node):
     sync_chain(node)
+    try:
+        pull_shares(node)
+    except Exception:
+        pass
     sync_transfers(node)
     revote_pending(node)
     push_chain(node)          # shove our blocks OUT so unreachable miners still count
 
 
 def auto_sync_loop(node):
+    # A seed receives blocks pushed to it by miners, so it does not need to go
+    # looking for the tip constantly. Checking far less often keeps it idle.
+    interval = 30 if getattr(node, "seed_only", False) else SYNC_INTERVAL
     tick = 0
     # sync once immediately so a fresh miner builds on the network's tip
     # instead of starting its own island from genesis
@@ -1395,7 +1807,7 @@ def auto_sync_loop(node):
     except Exception:
         pass
     while True:
-        time.sleep(SYNC_INTERVAL)
+        time.sleep(interval)
         tick += 1
         try:
             sync(node)
@@ -1422,7 +1834,13 @@ def exchange_peers(node):
         for url in data.get("peers", []):
             if len(node.peers) >= 25:
                 return
-            if url and url != node.my_url and url not in node.peers:
+            # Only add addresses we can actually reach. Gossip is full of other
+            # people's LAN addresses (10.x, 192.168.x, 169.254.x) which can never
+            # serve us the chain -- adding them just fills the peer list with dead
+            # ends and starves out the real reachable nodes, leaving us unable to
+            # sync at all. is_public_url filters those out.
+            if url and url != node.my_url and url not in node.peers \
+                    and is_public_url(url):
                 if meet(node, url):
                     add_event(node, f"discovered peer {url}")
                     print(f"\n  [peers] learned about {url} from the network"
@@ -1867,6 +2285,10 @@ def meet(node, peer):
 
 
 def discovery_beacon(node):
+    # A cloud server has no local network to shout across. Skipping this on a
+    # seed saves a surprising amount of work -- it was burning a full core.
+    if getattr(node, "seed_only", False):
+        return
     message = f"SOSAIEM2|{node.node_id}|{node.my_url}".encode()
     while True:
         try:
@@ -1880,6 +2302,8 @@ def discovery_beacon(node):
 
 
 def discovery_listener(node):
+    if getattr(node, "seed_only", False):
+        return
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1923,6 +2347,8 @@ def _mine_one_block_racing(node):
             counts[s["address"]] = counts.get(s["address"], 0) + 1
         reward = round(max(0.0, min(BLOCK_REWARD, remaining_supply(node.chain))), 8)
         txs = []
+        # prove this block came from a fair-split build
+        txs.append({"type": "version", "v": BUILD_MARKER})
         if share_list:
             txs.append({"type": "shares", "list": share_list})
         if reward > 0:
@@ -1944,13 +2370,82 @@ def _mine_one_block_racing(node):
 
     my_addr = node.payout_address
     ns = int(time.time() * 1e6) & ((1 << 48) - 1)
-    nb = 0
     fresh_shares = []
     race_start = time.time()
     last_beat = race_start
-    hashes_done = 0
+    last_pull = race_start
+
+    # --- the hashing crew -------------------------------------------------
+    # Mining used to run on a single core, so seven eighths of a normal machine
+    # sat idle. scrypt is implemented in C and lets go of Python's global lock
+    # while it works, so real threads really do run at the same time here --
+    # which is unusual for Python and is what makes this worth doing.
+    #
+    # Only the hashing is parallel. Deciding what to mine, collecting shares and
+    # accepting a won block all stay on this one thread, because that is the
+    # part where getting the order wrong costs someone their block.
+    n_workers = max(1, min(node.mine_threads, 32))
+    stop = threading.Event()
+    found_box = {"block": None}
+    share_box = []
+    box_lock = threading.Lock()
+    counter = {"hashes": 0}
+    gen = {"n": 0, "txs": candidate.transactions}
+
+    def worker(slot):
+        my_gen = -1
+        blk = None
+        nb = slot
+        sn = ns + slot
+        while not stop.is_set():
+            if gen["n"] != my_gen:
+                my_gen = gen["n"]
+                blk = Block(prev.index + 1, gen["txs"], prev_hash)
+                nb = slot
+            # a share attempt
+            sn += n_workers
+            if int(share_hash(prev_hash, my_addr, sn), 16) < s_target:
+                with box_lock:
+                    share_box.append(sn)
+            # a block attempt -- every worker walks a different lane of nonces
+            blk.nonce = nb
+            if int(blk.pow_hash(), 16) < target:
+                with box_lock:
+                    if found_box["block"] is None:
+                        found_box["block"] = blk
+                stop.set()
+                return
+            nb += n_workers
+            with box_lock:
+                counter["hashes"] += 2
+
+    crew = [threading.Thread(target=worker, args=(i,), daemon=True)
+            for i in range(n_workers)]
+    for t in crew:
+        t.start()
+
+    def shut_down():
+        stop.set()
+        for t in crew:
+            t.join(timeout=1.0)
     while True:
         now = time.time()
+        # The miner maxes the CPU, which can starve the background sync thread
+        # so badly that this node keeps building on a stale tip and every block
+        # it wins is already orphaned. So pull the network's tip ourselves every
+        # couple of seconds -- if a longer chain exists, adopt it and abandon
+        # this now-pointless attempt immediately.
+        if now - last_pull > 2:
+            last_pull = now
+            # No network calls here, ever. This loop is the mining thread, and
+            # anything that waits on a peer stops the machine from hashing --
+            # four peers with a three second timeout each meant it could sit
+            # idle for longer than it spent working. The background sync thread
+            # keeps the chain current; all this needs is a free memory read to
+            # notice when the tip has moved under it.
+            if node.chain.last_block.compute_hash() != prev_hash:
+                shut_down()
+                return None
         if now - last_beat > 15:
             queued = sum(len(v) for v in node.cur_shares["by"].values())
             # memory-hard attempts run in the tens per second, not the thousands,
@@ -1961,39 +2456,43 @@ def _mine_one_block_racing(node):
                   f"{queued} work-share(s) queued for this block)")
             last_beat = now
 
-        for _ in range(B_SHARE):
-            ns += 1
-            if int(share_hash(prev_hash, my_addr, ns), 16) < s_target:
-                fresh_shares.append(ns)
+        # collect whatever the crew has turned up since the last pass
+        with box_lock:
+            fresh_shares = share_box[:]
+            share_box.clear()
+            found_block = found_box["block"]
+            hashes_done = counter["hashes"]
 
         with node.lock:
             if node.chain.last_block.compute_hash() != prev_hash:
+                shut_down()
                 return None
             for n0 in fresh_shares:
                 node._add_share(my_addr, n0)
             if node.cur_shares["version"] != version:
                 version = node.cur_shares["version"]
                 candidate = build_candidate()
-                nb = 0
+                # hand the crew the new contents; they rebuild and carry on
+                gen["txs"] = candidate.transactions
+                gen["n"] += 1
         for n0 in fresh_shares:
             gossip(node, "/share",
                    {"prev_hash": prev_hash, "address": my_addr, "nonce": n0})
         fresh_shares = []
 
-        found = False
-        for _ in range(B_BLOCK):
-            candidate.nonce = nb
-            if int(candidate.pow_hash(), 16) < target:
-                found = True
-                break
-            nb += 1
-        hashes_done += B_SHARE + B_BLOCK
+        found = found_block is not None
+        if found:
+            candidate = found_block
+        else:
+            time.sleep(0.05)      # let the crew work; this thread only steers
 
         won = None
         with node.lock:
             if not node.mining:
+                shut_down()
                 return None
             if node.chain.last_block.compute_hash() != prev_hash:
+                shut_down()
                 return None
             if found:
                 node.chain.chain.append(candidate)
@@ -2004,8 +2503,10 @@ def _mine_one_block_racing(node):
             elif node.cur_shares["version"] != version:
                 version = node.cur_shares["version"]
                 candidate = build_candidate()
-                nb = 0
+                gen["txs"] = candidate.transactions
+                gen["n"] += 1
         if won:
+            shut_down()
             return won
 
 
@@ -2053,6 +2554,9 @@ def mining_loop(node):
 
 
 def start_mining(node):
+    if getattr(node, "seed_only", False):
+        return ("this node is running in seed mode -- it hosts the chain for\n"
+                "   everyone else and deliberately does no mining.")
     if node.mining:
         return "already mining -- type 'stop' to stop."
     node.mining = True
@@ -2156,6 +2660,7 @@ HELP = """
 
 
 def main():
+    _unfreeze_windows_console()
     port = 7000
     for arg in sys.argv[1:]:
         if arg.isdigit():
@@ -2185,11 +2690,32 @@ def main():
     load_seeds(node)
     node.no_upnp = "--no-upnp" in sys.argv
     node.no_nostr = "--no-nostr" in sys.argv
+    node.seed_only = ("--seed-only" in sys.argv) or ("--seed" in sys.argv)
+    for arg in sys.argv[1:]:
+        if arg.startswith("--threads="):
+            try:
+                node.mine_threads = max(1, min(32, int(arg.split("=", 1)[1])))
+            except ValueError:
+                pass
     threading.Thread(target=open_the_door, args=(node,), daemon=True).start()
     threading.Thread(target=retry_bootstrap, args=(node,), daemon=True).start()
     threading.Thread(target=seed_keeper, args=(node,), daemon=True).start()
     threading.Thread(target=nostr_announce_loop, args=(node,), daemon=True).start()
     threading.Thread(target=nostr_discover_loop, args=(node,), daemon=True).start()
+
+    # When there is no keyboard attached -- running under systemd, in a
+    # container, piped from anything -- there is no console to read. Reading
+    # stdin here would hit EOF instantly and quit, which is why the old service
+    # file wrapped this in "sleep infinity |". That wrapper made bash the main
+    # process, so when this node died systemd saw a healthy bash and never
+    # restarted anything: the node stayed dead until someone noticed by hand.
+    # Idling here instead lets systemd own the process directly and restart it
+    # the moment it actually crashes.
+    if not sys.stdin or not sys.stdin.isatty():
+        print("  Running headless (no console). Ctrl-C or systemctl stop to end.")
+        while True:
+            time.sleep(3600)
+
     print(HELP)
     while True:
         try:

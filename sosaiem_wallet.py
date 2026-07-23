@@ -27,13 +27,20 @@ SERIF = ("Georgia", 11)
 
 
 def start_node(port):
+    # Only load wallet + chain and open the port here. The network threads are
+    # started later, AFTER the window is on screen -- see main(). Running them
+    # before the GUI draws was what made the app fail to open once saved files
+    # existed: the heavy chain check plus network churn starved the window.
     node = core.Node(port)
     core.start_server(node)
+    return node
+
+
+def start_node_network(node):
     threading.Thread(target=core.auto_sync_loop, args=(node,), daemon=True).start()
     threading.Thread(target=core.discovery_beacon, args=(node,), daemon=True).start()
     threading.Thread(target=core.discovery_listener, args=(node,), daemon=True).start()
-    core.load_seeds(node)
-    return node
+    threading.Thread(target=core.load_seeds, args=(node,), daemon=True).start()
 
 
 class WalletApp:
@@ -269,6 +276,7 @@ def ask_restore(port):
 
 
 def main():
+    core._unfreeze_windows_console()
     if tk is None:
         print("tkinter is missing. Install Python from python.org (it includes it).")
         return
@@ -280,6 +288,7 @@ def main():
     node = start_node(port)
     root = tk.Tk()
     WalletApp(root, node)
+    root.after(1500, lambda: start_node_network(node))
     root.mainloop()
 
 

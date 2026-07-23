@@ -20,16 +20,16 @@ echo Installing build tools, please wait...
 echo.
 
 echo Building Sosaiem-Wallet.exe ...
-%PY% -m PyInstaller --onefile --windowed --name Sosaiem-Wallet --collect-all cryptography --collect-all dilithium_py sosaiem_wallet.py
+%PY% -m PyInstaller --onefile --console --name Sosaiem-Wallet --collect-all cryptography --collect-all dilithium_py sosaiem_wallet.py
 
 echo.
 echo Building Sosaiem-Miner.exe ...
-%PY% -m PyInstaller --onefile --windowed --name Sosaiem-Miner --collect-all cryptography --collect-all dilithium_py sosaiem_miner.py
+%PY% -m PyInstaller --onefile --console --name Sosaiem-Miner --collect-all cryptography --collect-all dilithium_py sosaiem_miner.py
 
 echo.
 echo ============================================================
 echo   DONE. Your two apps are in the  dist  folder:
-echo       dist\Sosaiem-Wallet.exe
+echo       dist\Sosaiem-Wallet.exe   (a small console window opens with it - that is normal)
 echo       dist\Sosaiem-Miner.exe
 echo   Upload those two files to your website.
 echo ============================================================

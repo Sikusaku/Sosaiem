@@ -27,10 +27,26 @@ POW_P = 1
 POW_MAXMEM = 2147483646
 
 
+import threading as _threading
+
+# Each attempt allocates 8 MB, on purpose -- that is what keeps mining off
+# custom chips. But N threads hashing at once need N x 8 MB, and a small server
+# will burn through its memory, start swapping, and stop answering anything.
+# This gate keeps the arithmetic honest without starving the miner: eight slots
+# is 64 MB at worst, which any machine that can run this can spare, while still
+# ruling out the unbounded case where a burst of verification takes the box down.
+# Enough room for a full mining crew plus the node's own verification work.
+# Each slot is 8 MB while held, so this is a ceiling of about 300 MB in the
+# worst case -- affordable on any machine that can mine, and still a hard limit
+# so a burst of verification can never take the whole box down.
+_HASH_SLOTS = _threading.Semaphore(36)
+
+
 def memory_hard(data: bytes) -> str:
     """The one piece of work in the whole system. Everything costly uses this."""
-    return hashlib.scrypt(data, salt=POW_SALT, n=POW_N, r=POW_R, p=POW_P,
-                          maxmem=POW_MAXMEM, dklen=32).hex()
+    with _HASH_SLOTS:
+        return hashlib.scrypt(data, salt=POW_SALT, n=POW_N, r=POW_R, p=POW_P,
+                              maxmem=POW_MAXMEM, dklen=32).hex()
 
 
 class Block:
@@ -113,16 +129,36 @@ class Blockchain:
         self.pending_transactions = []
         self._create_genesis_block()
 
-    def _create_genesis_block(self):
-        genesis = Block(
-            index=0,
-            transactions=["Sosaiem genesis block -- the chain begins. Owned by no one, open to everyone."],
-            previous_hash="0" * 64,
-            timestamp=0,
-        )
+    # The genesis block is identical for everyone and never changes, but mining
+    # it costs thousands of memory-hard hashes -- a minute or more of solid CPU
+    # at real difficulty. Building a chain object was doing that work every
+    # single time, including once per incoming chain submission, which was
+    # enough on its own to wedge a server permanently. Mine it once, keep it.
+    _GENESIS = None
+    _genesis_lock = _threading.Lock()
 
-        self._mine_block(genesis)
-        self.chain.append(genesis)
+    def _create_genesis_block(self):
+        # Without the lock, a burst of threads all building chain objects at
+        # once each see an empty cache and each mine the genesis block --
+        # thousands of memory-hard hashes per thread, all for a block whose
+        # answer is identical every time. That alone can pin a whole machine.
+        if Blockchain._GENESIS is None:
+            with Blockchain._genesis_lock:
+                if Blockchain._GENESIS is None:
+                    genesis = Block(
+                        index=0,
+                        transactions=["Sosaiem genesis block -- the chain begins. Owned by no one, open to everyone."],
+                        previous_hash="0" * 64,
+                        timestamp=0,
+                    )
+                    self._mine_block(genesis)
+                    Blockchain._GENESIS = genesis
+        g = Blockchain._GENESIS
+        # a fresh object each time, so callers can never mutate the shared one
+        copy = Block(index=g.index, transactions=list(g.transactions),
+                     previous_hash=g.previous_hash, timestamp=g.timestamp,
+                     nonce=g.nonce)
+        self.chain.append(copy)
 
     @property
     def last_block(self):
@@ -151,15 +187,21 @@ class Blockchain:
         self.pending_transactions = []
         print(f"done in {elapsed:.2f}s  (nonce={new_block.nonce}, hash={valid_hash[:16]}...)")
 
-    def is_chain_valid(self, skip_work=None):
+    def is_chain_valid(self, skip_work=None, links_only=False):
         """
         Check the chain holds together.
 
         `skip_work` is a set of block hashes whose proof-of-work this node has
-        already verified. The link check below still runs on every block every
-        time, and it is that check which catches a tampered block: changing any
-        block changes its hash, which breaks the next block's back-reference.
-        Only the expensive re-hashing is skipped.
+        already verified. The link check below runs on every block every time,
+        and it is that check which catches a tampered block: changing any block
+        changes its hash, which breaks the next block's back-reference. Only the
+        expensive re-hashing is skipped.
+
+        `links_only` skips the proof-of-work check entirely. Sync uses this so a
+        slow machine can keep up with the network's tip -- re-running memory-hard
+        scrypt on every new block inline meant a slow CPU could fall permanently
+        behind, validating up to block N while the network reached N+5. The full
+        proof is still confirmed in the background after adopting.
         """
         targets = compute_targets(self.chain)
         for i in range(1, len(self.chain)):
@@ -170,6 +212,8 @@ class Blockchain:
                 print(f"  ! Block {current.index} is not linked to block {previous.index} -- chain broken!")
                 return False
 
+            if links_only:
+                continue
             if skip_work is not None and current.compute_hash() in skip_work:
                 continue
             if int(current.pow_hash(), 16) >= targets[i]:
