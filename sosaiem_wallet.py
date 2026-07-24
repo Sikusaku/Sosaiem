@@ -320,6 +320,7 @@ def main():
     for arg in sys.argv[1:]:
         if arg.isdigit():
             port = int(arg)
+    want_threads = core.threads_from_args()
     ask_restore(port)
 
     # If this wallet is locked, ask before anything else -- the node cannot even
@@ -348,6 +349,8 @@ def main():
                     return
 
     node = start_node(port, password)
+    if want_threads:
+        node.mine_threads = want_threads
     root = tk.Tk()
     WalletApp(root, node)
     root.after(1500, lambda: start_node_network(node))

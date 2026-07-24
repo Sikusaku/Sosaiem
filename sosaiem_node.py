@@ -50,6 +50,23 @@ class ThreadingHTTPServer(_BaseHTTPServer):
             except Exception:
                 pass
 
+def threads_from_args(argv=None):
+    """
+    Read --threads=N from the command line.
+
+    Lives here so the node, the miner and the wallet all honour it. It used to
+    be parsed only in the node's own startup, so anyone running the desktop
+    miner with --threads=1 was quietly ignored and got the default instead.
+    """
+    for arg in (argv if argv is not None else sys.argv[1:]):
+        if arg.startswith("--threads="):
+            try:
+                return max(1, min(64, int(arg.split("=", 1)[1])))
+            except ValueError:
+                return None
+    return None
+
+
 def _unfreeze_windows_console():
     """
     Stop Windows pausing the whole program when someone clicks in the window.
@@ -109,7 +126,7 @@ ACTIVE_VALIDATOR_WINDOW = 15 * 60
 # window, faster syncing, bug fixes that only tighten what was already invalid.
 # Nobody has to agree on it and nothing can split over it.
 PROTOCOL_VERSION = 2
-NODE_VERSION = "2.10.0"
+NODE_VERSION = "2.11.3"
 
 # Blocks may carry a small tag naming the build that made them. It is accepted
 # and recorded, never required. A rule that forces everyone onto a particular
@@ -159,6 +176,14 @@ SHARE_EASE = 32
 # costs real memory and time. 2000 of them would make a single block take
 # most of a minute to check, which is a denial-of-service dressed as a block.
 MAX_SHARES_PER_BLOCK = 128
+
+# How many blocks back a work-share stays payable. Without this, a share only
+# counted for the exact block it was mined against, so anyone whose share
+# arrived a second late earned nothing at all -- and the miner who found blocks
+# fastest kept taking whole rewards. Five blocks is a few minutes of grace:
+# long enough that ordinary network delay never costs anyone their work, short
+# enough that the ledger stays easy to check.
+SHARE_WINDOW = 5
 
 
 def share_hash(prev_hash, address, nonce):
@@ -251,7 +276,8 @@ def block_to_dict(block):
             "previous_hash": block.previous_hash, "nonce": block.nonce}
 
 
-def _check_block_content(transactions, prev_hash, share_target, height=None):
+def _check_block_content(transactions, prev_hash, share_target, height=None,
+                         recent_tips=()):
     shares_entries = []
     rewards = []
     has_version_tag = False
@@ -289,10 +315,23 @@ def _check_block_content(transactions, prev_hash, share_target, height=None):
             if not isinstance(addr, str) or not addr.startswith("SOSA") \
                     or not isinstance(nonce, int):
                 return False, 0.0
-            if (addr, nonce) in seen:
+            # A share may name the tip it was mined against. Work done a moment
+            # before someone else found a block is still work, and throwing it
+            # away meant a fast miner kept whole rewards while everyone else's
+            # effort vanished on timing alone. A share stays payable for a few
+            # blocks, so nobody loses what they earned by being slightly late.
+            # Shares with no tip named are read as belonging to this block's own
+            # parent, which is exactly what every earlier block meant -- so the
+            # whole existing chain still validates unchanged.
+            at = s.get("prev", prev_hash)
+            if not isinstance(at, str):
                 return False, 0.0
-            seen.add((addr, nonce))
-            if int(share_hash(prev_hash, addr, nonce), 16) >= share_target:
+            if at != prev_hash and at not in recent_tips:
+                return False, 0.0
+            if (addr, nonce, at) in seen:
+                return False, 0.0
+            seen.add((addr, nonce, at))
+            if int(share_hash(at, addr, nonce), 16) >= share_target:
                 return False, 0.0
             counts[addr] = counts.get(addr, 0) + 1
 
@@ -328,6 +367,38 @@ _verified_work = set()
 # under a pile of later work; re-hashing them forever bought nothing and cost
 # the miner most of its speed.
 _verify_gate = threading.Semaphore(1)
+
+# Only one push and one sync may be in flight at a time. Six different events --
+# a block arriving, a share, a vote -- each used to start a fresh thread, and on
+# a busy node they arrived faster than they finished. Threads climbed past sixty,
+# every one holding connections and waiting on timeouts, memory grew, and the
+# node ended up unable to answer anything while using no processor at all.
+# Dropping a duplicate costs nothing: the work is idempotent and the regular
+# three-second loop performs it again shortly anyway.
+_push_gate = threading.Semaphore(1)
+_sync_gate = threading.Semaphore(1)
+
+
+def push_chain_once(node):
+    if not _push_gate.acquire(blocking=False):
+        return
+    try:
+        push_chain(node)
+    except Exception:
+        pass
+    finally:
+        _push_gate.release()
+
+
+def sync_once(node):
+    if not _sync_gate.acquire(blocking=False):
+        return
+    try:
+        sync(node)
+    except Exception:
+        pass
+    finally:
+        _sync_gate.release()
 VERIFY_DEPTH = 120
 _VERIFIED_CAP = 20000
 
@@ -336,6 +407,12 @@ def _remember_verified(block_id):
     if len(_verified_work) >= _VERIFIED_CAP:
         _verified_work.clear()
     _verified_work.add(block_id)
+
+
+def _tips_before(chain_list, index):
+    """The hashes of the few blocks just before this one -- the payable window."""
+    lo = max(0, index - 1 - SHARE_WINDOW)
+    return {b.compute_hash() for b in chain_list[lo:max(0, index - 1)]}
 
 
 def validate_full_chain(chain):
@@ -360,7 +437,8 @@ def validate_full_chain(chain):
             continue
         ok, block_reward = _check_block_content(
             block.transactions, block.previous_hash,
-            share_target_for(targets[block.index]), height=block.index)
+            share_target_for(targets[block.index]), height=block.index,
+            recent_tips=_tips_before(chain.chain, block.index))
         if not ok:
             return False
         if block_reward > BLOCK_REWARD + 1e-6:
@@ -382,7 +460,8 @@ def validate_new_block(chain, block):
         return False
     ok, block_reward = _check_block_content(
         block.transactions, block.previous_hash, share_target_for(target),
-        height=block.index)
+        height=block.index,
+        recent_tips=_tips_before(chain.chain + [block], block.index))
     if not ok:
         return False
     if block_reward > BLOCK_REWARD + 1e-6:
@@ -609,7 +688,8 @@ class Node:
                 target = targets[i] if i < len(targets) else MAX_TARGET
                 ok, _ = _check_block_content(
                     block.transactions, block.previous_hash,
-                    share_target_for(target), height=block.index)
+                    share_target_for(target), height=block.index,
+                    recent_tips=_tips_before(blocks, block.index))
                 if not ok or int(block.pow_hash(), 16) >= target:
                     # Do NOT throw the chain away. A background check deciding
                     # to wipe everything back to genesis is far more damaging
@@ -747,8 +827,13 @@ class Node:
             hist = self.recent_shares
             if old.get("prev") and old.get("by"):
                 hist[old["prev"]] = old["by"]
-                # keep only the last few tips' worth
-                while len(hist) > 3:
+                # Keep shares for exactly as long as they stay payable. The
+                # payable window is SHARE_WINDOW blocks, so a share mined that
+                # many tips back can still legitimately go into a block -- but
+                # only if we still have it. Retaining fewer tips than the window
+                # threw away work that was still owed payment, which stiffed
+                # slower miners on valid shares. Retention now tracks the window.
+                while len(hist) > SHARE_WINDOW:
                     hist.pop(next(iter(hist)))
             self.cur_shares = {"prev": tip, "by": {}, "version": 0}
 
@@ -768,6 +853,19 @@ class Node:
             balances[tx["from"]] = balances.get(tx["from"], 0) - tx["amount"]
             balances[tx["to"]] = balances.get(tx["to"], 0) + tx["amount"]
         return {a: round(b, 8) for a, b in balances.items()}
+
+    def all_stake(self, balances=None):
+        """
+        Every registered holder's stake, awake or not.
+
+        Used when judging a transfer other nodes have already settled. Live
+        voting rightly asks only those present -- but checking somebody else's
+        finished decision must not, or a node with no stake of its own (a seed
+        never mines) finds the total is zero, refuses to adopt anything, and
+        shows a transfer as pending for ever while everyone else has moved on.
+        """
+        balances = balances if balances is not None else self.get_balances()
+        return sum(max(balances.get(a, 0), 0.0) for a in self.registry)
 
     def total_stake(self, balances=None):
         """
@@ -1553,14 +1651,14 @@ def handle_incoming_block(node, block):
         print(f"\n  [block] accepted block {block.index} from a peer "
               f"({paid} miner(s) paid){extra}\nsosa:{node.port}> ", end="", flush=True)
         threading.Thread(target=broadcast_block, args=(node, block), daemon=True).start()
-        threading.Thread(target=push_chain, args=(node,), daemon=True).start()
+        threading.Thread(target=push_chain_once, args=(node,), daemon=True).start()
         with node.lock:
             newly = node.retally()
         for sig in newly:
             announce_confirm(node, sig)
         return "accepted"
     if need_sync:
-        threading.Thread(target=sync, args=(node,), daemon=True).start()
+        threading.Thread(target=sync_once, args=(node,), daemon=True).start()
         return "resync"
     return "duplicate"
 
@@ -1662,7 +1760,7 @@ def handle_submit_chain(node, data):
         for sig in newly:
             announce_confirm(node, sig)
         # relay onward to reachable peers; home nodes get it via their own pull
-        threading.Thread(target=push_chain, args=(node,), daemon=True).start()
+        threading.Thread(target=push_chain_once, args=(node,), daemon=True).start()
     return "adopted" if adopted else "kept"
 
 
@@ -1717,7 +1815,7 @@ def handle_incoming_vote(node, vote):
         announce_confirm(node, sig)
 
     if fresh and sig not in node.transfers:
-        threading.Thread(target=sync, args=(node,), daemon=True).start()
+        threading.Thread(target=sync_once, args=(node,), daemon=True).start()
     return "ok"
 
 
@@ -1746,20 +1844,31 @@ def sync_chain(node):
         futures = {}
         for p in peers:
             try:
-                futures[_out_pool.submit(get_json, p.rstrip("/") + "/info", 1.5)] = p
+                futures[_out_pool.submit(get_json, p.rstrip("/") + "/info", 30)] = p
             except Exception:
                 pass
-        deadline = time.time() + 3
-        for fut, p in futures.items():
-            left = deadline - time.time()
-            if left <= 0:
-                break
-            try:
-                info = fut.result(timeout=left)
-            except Exception:
-                continue
-            if info and isinstance(info.get("blocks"), int) and info["blocks"] >= mine:
-                ahead.append((info["blocks"], p))
+        # Whoever answers first, counts first. Waiting on each peer in turn meant
+        # one slow or dead address at the front of the queue held up every reply
+        # behind it -- so a generous timeout, needed for peers on the other side
+        # of the world, ended up slowing everyone down instead. Now a nearby peer
+        # answers in milliseconds and we move on; a distant one still gets its
+        # full eight seconds, but only in the background.
+        try:
+            from concurrent.futures import as_completed
+            for fut in as_completed(list(futures), timeout=35):
+                p = futures[fut]
+                try:
+                    info = fut.result(timeout=0)
+                except Exception:
+                    continue
+                if info and isinstance(info.get("blocks"), int) and info["blocks"] >= mine:
+                    ahead.append((info["blocks"], p))
+                # enough to work with, and someone is ahead: stop waiting
+                if len(ahead) >= 3:
+                    break
+        except Exception:
+            pass
+
     good = {p for _, p in ahead}
     for p in peers:
         if p in good:
@@ -1775,7 +1884,14 @@ def sync_chain(node):
 
     best, source = node.chain, None
     for _, peer in ahead[:3]:
-        data = get_json(peer.rstrip("/") + "/chain", timeout=12)
+        # The whole chain is a bulk download and it grows: 267 blocks was ~680 KB,
+        # 2750 blocks is several megabytes. Twelve seconds was fine early on and
+        # quietly stopped being enough -- a node abroad would ask who was ahead
+        # (a few bytes, always fine), start the real download, run out of time,
+        # and conclude it was up to date at block one. Then it mined its own
+        # chain that nobody would ever accept. This is a once-per-catch-up cost,
+        # so give it room.
+        data = get_json(peer.rstrip("/") + "/chain", timeout=120)
         if data is None:
             continue
         cand = list_to_chain(data)
@@ -1839,7 +1955,7 @@ def sync_transfers(node):
                               if vote_is_valid(v) and v.get("tx_signature") == sig
                               and v.get("validator") == a}
                 balances = node.get_balances()
-                total = node.total_stake(balances)
+                total = node.all_stake(balances)
                 yes = sum(max(balances.get(a, 0), 0.0)
                           for a, v in good_votes.items()
                           if v.get("approve") and a in node.registry)
@@ -2281,16 +2397,35 @@ def retry_bootstrap(node):
     was down still joins later without anyone restarting it.
     """
     delay = 30
+    last_height = -1
+    stuck_for = 0
     while True:
         time.sleep(delay)
         with node.lock:
             alone = not node.peers
-        if not alone:
+            height = len(node.chain.chain)
+
+        # Having a peer is not the same as being on the network. Two nodes on
+        # one desk will happily find each other, agree they are both at block
+        # three, and sit there for ever -- neither is ahead, so neither syncs,
+        # and because a peer exists nothing ever went back to the seed list.
+        # A miner in China spent an evening in exactly that state. So: if the
+        # chain has not moved in a few minutes, treat it as isolation and go
+        # looking for a way in again, peers or no peers.
+        if height == last_height:
+            stuck_for += 1
+        else:
+            stuck_for = 0
+            last_height = height
+
+        if alone or stuck_for >= 6:
+            if load_seeds(node) and not alone:
+                stuck_for = 0        # found fresh addresses; give them a chance
+            elif alone and load_seeds(node):
+                return
+            delay = min(delay * 2, 600) if alone else 30
+        else:
             delay = 30
-            continue
-        if load_seeds(node):
-            return
-        delay = min(delay * 2, 600)      # back off, but never give up
 
 
 def check_peer_rules(node, peer):
@@ -2406,7 +2541,7 @@ def meet(node, peer):
     node.save_peers()
     introduce_self(node, peer)
     threading.Thread(target=check_peer_rules, args=(node, peer), daemon=True).start()
-    threading.Thread(target=sync, args=(node,), daemon=True).start()
+    threading.Thread(target=sync_once, args=(node,), daemon=True).start()
     return True
 
 
@@ -2463,9 +2598,34 @@ def _mine_one_block_racing(node):
     B_BLOCK = 12
 
     def build_candidate():
+        # Everyone who did work in the last few blocks gets paid, not only the
+        # people whose share happened to land in the instant before this block
+        # was found. Anything already paid by a block on this chain is left out,
+        # so nobody is credited twice for the same work.
+        already = set()
+        tail = node.chain.chain[-(SHARE_WINDOW + 1):]
+        for b in tail:
+            for tx in b.transactions:
+                if isinstance(tx, dict) and tx.get("type") == "shares":
+                    for it in (tx.get("list") or []):
+                        if isinstance(it, dict):
+                            already.add((it.get("address"), it.get("nonce"),
+                                         it.get("prev", b.previous_hash)))
+
         share_list = [{"address": a, "nonce": n}
                       for a in sorted(node.cur_shares["by"])
-                      for n in sorted(node.cur_shares["by"][a])]
+                      for n in sorted(node.cur_shares["by"][a])
+                      if (a, n, prev_hash) not in already]
+
+        # then the older ones, still within the window
+        window = {b.compute_hash() for b in node.chain.chain[-(SHARE_WINDOW + 1):-1]}
+        for tip, by in list(node.recent_shares.items()):
+            if tip not in window:
+                continue
+            for a in sorted(by):
+                for n in sorted(by[a]):
+                    if (a, n, tip) not in already:
+                        share_list.append({"address": a, "nonce": n, "prev": tip})
 
         share_list = share_list[:MAX_SHARES_PER_BLOCK]
         counts = {}
@@ -2664,7 +2824,7 @@ def mining_loop(node):
         node.mine_stats["earned"] = round(node.mine_stats["earned"] + my_cut, 8)
         node.mine_stats["blocks"] += 1
         threading.Thread(target=broadcast_block, args=(node, block), daemon=True).start()
-        threading.Thread(target=push_chain, args=(node,), daemon=True).start()
+        threading.Thread(target=push_chain_once, args=(node,), daemon=True).start()
         elapsed = time.time() - node.mine_stats["start"]
         rate_hr = (node.mine_stats["earned"] / elapsed * 3600) if elapsed > 0 else 0
         add_event(node, f"won block {len(node.chain.chain) - 1}: +{my_cut:.6f} SOSA "

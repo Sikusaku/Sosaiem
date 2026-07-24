@@ -190,7 +190,10 @@ def main():
     for arg in sys.argv[1:]:
         if arg.isdigit():
             port = int(arg)
+    want_threads = core.threads_from_args()
     node = start_node(port)
+    if want_threads:
+        node.mine_threads = want_threads
     root = tk.Tk()
     MinerApp(root, node)
     root.after(1500, lambda: start_node_network(node))

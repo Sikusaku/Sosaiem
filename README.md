@@ -1,78 +1,51 @@
-# Sosaiem — society's coin
+# Sosaiem (SOSA)
 
-A post-quantum, feeless, leaderless cryptocurrency, built in the open and owned by no one.
-No company, no pre-mine, no gatekeepers. Website: **[sosaiem.com](https://sosaiem.com)** · Chat: **[Discord](https://discord.gg/GQSrcpXcpy)**
+Sosaiem is a real, from-scratch **proof-of-work cryptocurrency** written in Python —
+its own blockchain, its own consensus, no dependency on another chain. It is
+open-source so anyone can read exactly how it works and verify there is nothing
+hidden.
 
-Every line here is readable — that's the point. Inspect it before you trust it.
+Current build: **2.11.3** · consensus protocol **v2** · target block time **60s** ·
+block reward **1.66666667 SOSA** · max supply **12,212,010 SOSA**.
 
-## What it is
+## How rewards work (fair, no owner)
 
-- **Post-quantum from genesis.** Every wallet and vote is signed with ML-DSA (NIST FIPS 204),
-  designed to resist quantum computers — not retrofitted later.
-- **Fixed supply: 12,212,010 SOSA.** Created only by mining, ~100 SOSA/hour network-wide, until the
-  cap is reached. No lever to print more.
-- **Fair mining, built for ordinary machines.** The work is memory-hard (8 MB per attempt), which
-  strips purpose-built mining chips of the advantage they get from plain hashing. Every active miner
-  also earns a share of every block by verifiable work — pool-smooth earnings, no pool operator.
-- **17-word recovery phrases.** Lose the computer, write the words in, get the wallet back.
-- **Feeless transfers.** Sending costs nothing and waits for no miner: transfers confirm in seconds
-  by stake-weighted vote among holders. Your coins are your voice; forged identities carry no weight.
-- **Every node is the whole coin.** Wallet, explorer, and miner run on each participant's own machine.
+Mining reward for each block is **split proportionally among everyone whose work-shares
+are in that block** — the more work you did, the bigger your slice. There is **no pool
+owner and no custody**: rewards go straight from each block to each miner's own wallet.
+A slower miner's shares stay claimable for several blocks, so honest work isn't thrown
+away just for arriving a moment late.
 
-Read the full design in the [whitepaper](https://sosaiem.com/whitepaper.html).
+## Running it
 
-## Run it
+Requires Python 3. No packages to install — everything uses the standard library.
 
-**Easiest (Windows):** download the ready-made apps from
-[sosaiem.com](https://sosaiem.com) — `Sosaiem-Wallet` and `Sosaiem-Miner`. No install.
+- **Run a node:** `python sosaiem_node.py 80`
+- **Mine:** run the miner app and point it at your wallet address.
+- **Wallet:** run the wallet app to hold and send SOSA.
 
-**From source (any OS):**
+On Windows you can build click-to-run `.exe` files with `build_exe.bat`, and start
+things with `start_miner.bat` / `start_wallet.bat`.
 
-```
-pip install dilithium-py cryptography
-python3 sosaiem_wallet.py      # your wallet — hold and send SOSA
-python3 sosaiem_miner.py       # paste your wallet address, then mine
-```
-
-A node finds the network automatically. To point at specific nodes, list them in `seeds.txt`
-(one URL per line).
+Nodes try to make themselves reachable automatically (UPnP via `portmap.py`) and find
+each other through decentralized relays (Nostr via `nostrseed.py`), so the network does
+not depend on any single server.
 
 ## Files
 
 | File | What it is |
-|------|-----------|
-| `sosaiem_node.py` | the full node — mining, stake-voting transfers, P2P networking, block explorer |
-| `sosaiem_wallet.py` | desktop wallet app (holds your key) |
-| `sosaiem_miner.py` | desktop miner app (never holds keys; mines to any address) |
-| `blockchain.py` | blocks, chain, proof-of-work, difficulty |
-| `coin.py` | transfers, rewards, balances, supply cap |
-| `wallet.py` | post-quantum keys, signing, addresses |
-| `seedphrase.py` | 17-word wallet recovery |
-| `portmap.py` | asks the router to open a port, so home machines can host newcomers |
-| `nostrseed.py` | announces the node to public relays, so finding the network needs no central list |
-| `build_exe.bat` | builds the Windows apps from source |
+| --- | --- |
+| `sosaiem_node.py` | The node: mining, transfers, P2P networking, all the rules |
+| `blockchain.py` | Blocks, chain, difficulty |
+| `coin.py` | Rewards, transfers, balances, supply cap |
+| `wallet.py`, `seedphrase.py` | Keys, signing, recovery phrases |
+| `sosaiem_miner.py`, `sosaiem_wallet.py` | The miner and wallet apps |
+| `portmap.py` | Asks the router to open a port (UPnP) so home nodes are reachable |
+| `nostrseed.py` | Finds the network via Nostr relays, no central server needed |
+| `seeds.txt` | Starter list of nodes to connect to |
+| `build_exe.bat`, `start_miner.bat`, `start_wallet.bat` | Windows build/run helpers |
 
-## Honest status
+## Note
 
-Sosaiem is a young, community-run experiment. It works, but it has real limits, stated plainly
-rather than hidden:
-
-- **51% / majority-stake:** while few people mine, the chain can be out-mined and rewritten. Security
-  grows only as more independent people run miners and nodes.
-- **Reachability:** the network currently leans on reachable nodes as a backbone (as Bitcoin does);
-  fully serverless peer-to-peer through home routers is not solved here.
-- **Not audited:** the cryptographic libraries are standard, but this protocol code has had no formal
-  security review.
-- **Nobody can promise it will be worth anything.** Mine it because the idea is interesting.
-
-Run a node because the idea matters to you. Read the code. Decide for yourself.
-
-## Building the Windows apps
-
-```
-pip install cryptography dilithium-py pyinstaller
-build_exe.bat
-```
-
-Produces `dist/Sosaiem-Wallet.exe` and `dist/Sosaiem-Miner.exe`. They are unsigned, so antivirus
-software will complain; that is unavoidable without a code-signing certificate.
+This is a young, community-run project. The code here is the version currently live on
+the network. Treat it as experimental software.
