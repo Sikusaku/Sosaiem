@@ -79,7 +79,7 @@ def _unfreeze_windows_console():
         pass
 
 
-from wallet import Wallet, verify_signature
+from wallet import Wallet, verify_signature, WalletLocked, WrongPassword
 from blockchain import (Blockchain, Block, next_target, compute_targets,
                         MAX_TARGET, memory_hard)
 from coin import (compute_balances, total_minted, remaining_supply,
@@ -89,6 +89,11 @@ from coin import (compute_balances, total_minted, remaining_supply,
 
 
 SYNC_INTERVAL = 3
+
+# A validator counts toward the vote for this long after we last heard from it.
+# Long enough to survive a restart or a slow connection, short enough that
+# wallets closed days ago do not hold everyone else's transfers hostage.
+ACTIVE_VALIDATOR_WINDOW = 15 * 60
 
 # --- versions -----------------------------------------------------------
 # PROTOCOL_VERSION describes the *consensus rules*: what makes a block or a
@@ -104,7 +109,7 @@ SYNC_INTERVAL = 3
 # window, faster syncing, bug fixes that only tighten what was already invalid.
 # Nobody has to agree on it and nothing can split over it.
 PROTOCOL_VERSION = 2
-NODE_VERSION = "2.7.0"
+NODE_VERSION = "2.10.0"
 
 # Blocks may carry a small tag naming the build that made them. It is accepted
 # and recorded, never required. A rule that forces everyone onto a particular
@@ -428,7 +433,7 @@ def vote_is_valid(v):
 
 
 class Node:
-    def __init__(self, port):
+    def __init__(self, port, wallet_password=None):
         self.port = port
         self.node_id = uuid.uuid4().hex[:8]
         self.my_url = f"http://{get_lan_ip()}:{port}"
@@ -443,6 +448,7 @@ class Node:
         # error that a catch-all quietly swallowed -- which silently discarded
         # a perfectly good 267-block chain and started over from genesis.
         self.seed_only = False
+        self.wallet_password = wallet_password
         self.no_upnp = False
         self.no_nostr = False
 
@@ -461,6 +467,12 @@ class Node:
         self.lock = threading.RLock()
 
         self.registry = {self.wallet.address(): {"pubkey": self.wallet.public_key_hex()}}
+        # When each validator was last heard from. Without this, "half the
+        # stake must agree" meant half of every coin ever mined, including
+        # coins belonging to people who have not run the software in days --
+        # so a small holder could never move their own money. Nobody was
+        # refusing; the votes simply could not arrive.
+        self.seen_at = {self.wallet.address(): time.time()}
 
         self.transfers = {}
 
@@ -486,9 +498,17 @@ class Node:
         self.cur_shares = {"prev": None, "by": {}, "version": 0}
         self.recent_shares = {}   # tip_hash -> {address: {nonces}} for recent tips
         self.peer_misses = {}     # peer -> consecutive failed checks
-        # How many cores to mine with. One is left free so the machine stays
-        # usable and the node can still answer the network while mining flat out.
-        self.mine_threads = max(1, (os.cpu_count() or 2) - 1)
+        # How many cores to mine with.
+        #
+        # Half the machine by default. Taking all-but-one pinned people's CPUs at
+        # 98% and made the miner unpleasant to leave running -- which matters
+        # more than peak hashrate, because a miner someone turns off mines
+        # nothing. Set SOS_THREADS, or pass --threads=, to choose your own.
+        # (SOS_THREADS is exactly what a miner asked for, so it is what it is.)
+        try:
+            self.mine_threads = max(1, min(64, int(os.environ["SOS_THREADS"])))
+        except (KeyError, ValueError):
+            self.mine_threads = max(1, (os.cpu_count() or 2) // 2)
         self._load_validators()
         self._load_transfers()
         if self.peers:
@@ -496,7 +516,17 @@ class Node:
 
     def _load_or_create_wallet(self):
         if os.path.exists(self.wallet_file):
-            w = Wallet.load_from_file(self.wallet_file)
+            # A locked wallet needs its password. Whoever is starting us decides
+            # how to ask for it -- the desktop app pops a box, a server reads
+            # SOSA_PASSWORD from its environment, and the console asks here.
+            if Wallet.is_locked(self.wallet_file):
+                pw = self.wallet_password or os.environ.get("SOSA_PASSWORD")
+                if not pw and sys.stdin and sys.stdin.isatty():
+                    import getpass
+                    pw = getpass.getpass("  Wallet password: ")
+                w = Wallet.load_from_file(self.wallet_file, password=pw)
+            else:
+                w = Wallet.load_from_file(self.wallet_file)
             print(f"  Loaded wallet: {w.address()}")
             if not w.has_phrase():
                 print("  (this wallet predates recovery phrases -- it has no backup words.")
@@ -740,8 +770,21 @@ class Node:
         return {a: round(b, 8) for a, b in balances.items()}
 
     def total_stake(self, balances=None):
+        """
+        The stake that is actually online and able to vote.
+
+        Counting everyone who ever held a coin made transfers impossible the
+        moment the large holders closed their wallets: a majority of all coins
+        can never be reached if most of those coins are asleep. Only stake that
+        has been heard from recently is asked to agree -- which is what
+        "confirmed by the holders who are online" was always meant to mean.
+        """
         balances = balances if balances is not None else self.get_balances()
-        return sum(max(balances.get(a, 0), 0.0) for a in self.registry)
+        cutoff = time.time() - ACTIVE_VALIDATOR_WINDOW
+        live = [a for a in self.registry if self.seen_at.get(a, 0) >= cutoff]
+        if not live:
+            live = [self.wallet.address()]
+        return sum(max(balances.get(a, 0), 0.0) for a in live)
 
     def _committed_outgoing(self, addr, excluding_sig):
         total = 0.0
@@ -777,8 +820,10 @@ class Node:
         if total <= 0:
             return False
         yes = 0.0
+        cutoff = time.time() - ACTIVE_VALIDATOR_WINDOW
         for addr, vote in self.votes.get(sig, {}).items():
-            if vote.get("approve") and addr in self.registry:
+            if (vote.get("approve") and addr in self.registry
+                    and self.seen_at.get(addr, 0) >= cutoff):
                 yes += max(balances.get(addr, 0), 0.0)
         if yes * 2 > total:
             tx = self.transfers[sig]
@@ -1036,6 +1081,7 @@ def make_handler(node):
         def do_GET(self):
             if not self._gate():
                 return
+            self.note_inbound()
             if self.path in ("/", "/dashboard"):
                 if not self._local():
                     self._json({"error": "the wallet dashboard answers only on "
@@ -1099,7 +1145,10 @@ def make_handler(node):
                 self._json_raw(_cached_chain_payload(node))
             elif self.path == "/state":
                 with node.lock:
-                    self._json({"registry": node.registry, "log": node.confirmed_log,
+                    cut = time.time() - ACTIVE_VALIDATOR_WINDOW
+                    self._json({"registry": node.registry,
+                                "live": [a for a, t in node.seen_at.items() if t >= cut],
+                                "log": node.confirmed_log,
                                 "url": node.public_url or node.my_url})
             elif self.path == "/info":
                 with node.lock:
@@ -1366,6 +1415,34 @@ def make_handler(node):
             else:
                 self._json({"error": "unknown"}, 404)
 
+        def note_inbound(self):
+            """
+            Someone from the open internet just connected to us, so we are
+            reachable -- by definition, whatever our peers were able to prove.
+            This matters because reachability used to be decided only by asking
+            peers to call back, and when every peer sits behind a home router
+            nobody can perform that test. The one genuinely public node on the
+            network therefore believed it was unreachable and never announced
+            itself to the relays, so the relay fallback -- the whole point of
+            which is to work when the seed list does not -- had nothing to find.
+            """
+            try:
+                who = self.client_address[0]
+            except Exception:
+                return
+            if not who or who.startswith(("127.", "10.", "192.168.", "169.254.", "172.")):
+                return
+            if node.reachable:
+                return
+            host = self.headers.get("Host", "")
+            host = host.split(",")[0].strip()
+            if host and not host.startswith("localhost"):
+                url = "http://" + host if "://" not in host else host
+                if is_public_url(url):
+                    with node.lock:
+                        node.public_url = url.rstrip("/")
+                        node.reachable = True
+
         def log_message(self, *a): pass
         def log_error(self, *a): pass
 
@@ -1396,14 +1473,27 @@ def handle_incoming_share(node, s):
             or not isinstance(nonce, int) or not isinstance(prev_hash, str):
         return "ignored"
 
-    # A seed does not mine, so it has no use for shares of its own -- but miners
-    # sitting behind home routers can often only reach each other through it, so
-    # it still has to pass them along or the reward split breaks. Checking each
-    # one costs a memory-hard hash, and with several miners submitting steadily
-    # that was most of this machine's processor. Every miner verifies the shares
-    # it receives, and a block carrying a bad share is rejected outright, so the
-    # check still happens where it counts.
+    # A seed does not mine, so it never needs shares for itself -- but it is the
+    # only node most miners can reach, which makes it the only place they can
+    # collect anyone else's work from. Relaying alone was not enough: passing a
+    # share onward and keeping nothing meant /shares always answered "none", so
+    # every miner behind a router built blocks containing only its own work and
+    # paid only itself. That is why a miner's balance came out as an exact
+    # multiple of the full block reward instead of a spread of fractions.
+    #
+    # So: keep them. Deliberately without verifying -- a seed earns nothing, so
+    # it cannot be cheated out of anything, and checking each share costs a
+    # memory-hard hash it should be spending on serving the network. Whoever
+    # pulls a share verifies it before using it, and a block carrying a bad one
+    # is rejected outright, so the arithmetic is still checked where it matters.
     if getattr(node, "seed_only", False):
+        with node.lock:
+            node._ensure_share_height()
+            if prev_hash == node.cur_shares["prev"]:
+                bucket = node.cur_shares["by"].setdefault(addr, set())
+                if len(bucket) < MAX_SHARES_PER_BLOCK and nonce not in bucket:
+                    bucket.add(nonce)
+                    node.cur_shares["version"] += 1
         gossip(node, "/share", s)
         return "relayed"
 
@@ -1499,10 +1589,32 @@ def push_chain(node):
         base = peer.rstrip("/")
         info = get_json(base + "/info")
         peer_blocks = info.get("blocks", 0) if isinstance(info, dict) else 0
-        if n > peer_blocks:
+        if n <= peer_blocks:
+            continue
+        behind = n - peer_blocks
+
+        # If they are only a little behind, send exactly the blocks they are
+        # missing, in order. That is a few KB and lands immediately. Shipping
+        # the entire chain for the sake of one new block meant a home upload
+        # had to move most of a megabyte before a peer could learn about it --
+        # slow, easy to time out, and when it timed out the block simply never
+        # reached anyone. The miner kept winning blocks that nobody else ever
+        # saw, then lost them all the moment it took someone else's chain.
+        if behind <= 25:
             with node.lock:
-                payload = chain_to_list(node.chain)
-            post_json(base + "/submit_chain", payload)
+                missing = [block_to_dict(b) for b in node.chain.chain[peer_blocks:]]
+            sent_all = True
+            for blk in missing:
+                if post_json(base + "/block", blk, timeout=15) is None:
+                    sent_all = False
+                    break
+            if sent_all:
+                continue
+
+        # Far behind, or the block-by-block catch-up did not take: send the lot.
+        with node.lock:
+            payload = chain_to_list(node.chain)
+        post_json(base + "/submit_chain", payload, timeout=90)
 
 
 def handle_submit_chain(node, data):
@@ -1534,8 +1646,15 @@ def handle_submit_chain(node, data):
             node._last_push_len = len(cand.chain)
             adopted = True
     if adopted:
-        threading.Thread(target=node._verify_chain_background,
-                         args=(cand,), daemon=True).start()
+        # A seed must not do this. Miners push their chain here constantly, and
+        # each push was starting a fresh deep verification of a hundred-odd
+        # blocks and every work-share in them -- thousands of memory-hard
+        # hashes. One finished, the next push arrived, it began again, and the
+        # machine sat at 100% forever while answering nothing. The other two
+        # launch points already skipped seeds; this one was missed.
+        if not node.seed_only:
+            threading.Thread(target=node._verify_chain_background,
+                             args=(cand,), daemon=True).start()
         print(f"\n  [relay] adopted a pushed chain -> {len(cand.chain)} blocks"
               f"\nsosa:{node.port}> ", end="", flush=True)
         with node.lock:
@@ -1578,6 +1697,8 @@ def handle_incoming_vote(node, vote):
                 return "busy"                 # don't let the registry grow forever
             node.registry[vote["validator"]] = {"pubkey": vote["validator_pubkey"]}
             node.save_validators()
+        # hearing from them is what makes their stake count
+        node.seen_at[vote["validator"]] = time.time()
         # only start tracking votes for a brand-new transfer if we have room
         if (sig not in node.votes and sig not in node.transfers
                 and len(node.votes) >= MAX_VOTE_TABLES):
@@ -1697,6 +1818,9 @@ def sync_transfers(node):
         if not state:
             continue
         with node.lock:
+            for addr in state.get("live", []):
+                if isinstance(addr, str):
+                    node.seen_at[addr] = time.time()
             for addr, info in state.get("registry", {}).items():
                 pub = info.get("pubkey")
                 if addr not in node.registry and pub \
@@ -1740,6 +1864,8 @@ def sync_transfers(node):
 
 
 def pull_shares(node):
+    if getattr(node, "seed_only", False):
+        return 0        # a seed keeps what is pushed to it; it never needs more
     """
     Ask peers for the work-shares they have collected.
 
@@ -2691,6 +2817,14 @@ def main():
     node.no_upnp = "--no-upnp" in sys.argv
     node.no_nostr = "--no-nostr" in sys.argv
     node.seed_only = ("--seed-only" in sys.argv) or ("--seed" in sys.argv)
+    for arg in sys.argv[1:]:
+        if arg.startswith("--public-url="):
+            u = arg.split("=", 1)[1].strip().rstrip("/")
+            if is_public_url(u):
+                node.public_url = u
+                node.reachable = True
+                print(f"  Announcing as {u} -- newcomers can find this node "
+                      f"through the public relays.")
     for arg in sys.argv[1:]:
         if arg.startswith("--threads="):
             try:

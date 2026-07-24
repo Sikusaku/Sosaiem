@@ -5,6 +5,34 @@ import json
 
 
 from dilithium_py.ml_dsa import ML_DSA_65 as MLDSA
+import os
+import base64
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes as _h
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+
+class WalletLocked(Exception):
+    """The wallet file is encrypted and no password was given."""
+
+
+class WrongPassword(Exception):
+    """The password did not open the wallet."""
+
+
+def _key_from(password: str, salt: bytes) -> bytes:
+    # 400k rounds: slow enough that guessing a weak password is painful, fast
+    # enough that unlocking your own wallet is not.
+    kdf = PBKDF2HMAC(algorithm=_h.SHA256(), length=32, salt=salt, iterations=400_000)
+    return base64.urlsafe_b64encode(kdf.derive(password.encode("utf-8")))
+
+
+def _seal(plaintext: str, password: str, salt: bytes) -> str:
+    return Fernet(_key_from(password, salt)).encrypt(plaintext.encode()).decode()
+
+
+def _unseal(sealed: str, password: str, salt: bytes) -> str:
+    return Fernet(_key_from(password, salt)).decrypt(sealed.encode()).decode()
 
 import seedphrase
 
@@ -62,24 +90,58 @@ class Wallet:
         signature = MLDSA.sign(self._sk, message.encode("utf-8"))
         return signature.hex()
 
-    def save_to_file(self, filename: str):
-        data = {
-            "scheme": "ML-DSA-65",
-            "public_key": self._pk.hex(),
+    def save_to_file(self, filename: str, password: str = None):
+        """
+        Write the wallet out. With a password, the secret key and the recovery
+        words are encrypted and the file is useless to anyone who copies it.
+
+        Without one the file is plain text, which is how it has always worked --
+        anything that could read the folder owned the coins in it. Existing
+        wallets keep loading exactly as before, so nobody is locked out by this.
+        """
+        secret = json.dumps({
             "secret_key": self._sk.hex(),
-        }
-        if self.phrase:
-            # the file already holds the secret key in the clear, so keeping the
-            # phrase beside it adds no new exposure and means the wallet can
-            # show you the words again if you didn't write them down
-            data["recovery_phrase"] = self.phrase
+            "recovery_phrase": self.phrase,
+        })
+        data = {"scheme": "ML-DSA-65", "public_key": self._pk.hex()}
+        if password:
+            salt = os.urandom(16)
+            data["locked"] = True
+            data["salt"] = salt.hex()
+            data["sealed"] = _seal(secret, password, salt)
+        else:
+            data["secret_key"] = self._sk.hex()
+            if self.phrase:
+                data["recovery_phrase"] = self.phrase
         with open(filename, "w") as f:
             json.dump(data, f)
 
     @staticmethod
-    def load_from_file(filename: str):
+    def is_locked(filename: str) -> bool:
+        """True if this wallet file needs a password."""
+        try:
+            with open(filename) as f:
+                return bool(json.load(f).get("locked"))
+        except Exception:
+            return False
+
+    @staticmethod
+    def load_from_file(filename: str, password: str = None):
         with open(filename) as f:
             data = json.load(f)
+        if data.get("locked"):
+            if not password:
+                raise WalletLocked("this wallet is password protected")
+            try:
+                inner = json.loads(_unseal(data["sealed"], password,
+                                           bytes.fromhex(data["salt"])))
+            except Exception:
+                raise WrongPassword("wrong password")
+            return Wallet(
+                secret_key=bytes.fromhex(inner["secret_key"]),
+                public_key=bytes.fromhex(data["public_key"]),
+                phrase=inner.get("recovery_phrase"),
+            )
         return Wallet(
             secret_key=bytes.fromhex(data["secret_key"]),
             public_key=bytes.fromhex(data["public_key"]),

@@ -7,8 +7,10 @@ import webbrowser
 
 try:
     import tkinter as tk
+    from tkinter import simpledialog, messagebox
 except Exception:
     tk = None
+    simpledialog = messagebox = None
 
 import sosaiem_node as core
 from wallet import Wallet
@@ -26,12 +28,12 @@ MONO = ("Consolas", 10)
 SERIF = ("Georgia", 11)
 
 
-def start_node(port):
+def start_node(port, password=None):
     # Only load wallet + chain and open the port here. The network threads are
     # started later, AFTER the window is on screen -- see main(). Running them
     # before the GUI draws was what made the app fail to open once saved files
     # existed: the heavy chain check plus network churn starved the window.
-    node = core.Node(port)
+    node = core.Node(port, wallet_password=password)
     core.start_server(node)
     return node
 
@@ -117,6 +119,9 @@ class WalletApp:
             tk.Button(backup, text="Show recovery phrase", command=self.show_phrase,
                       bg=PANEL, fg=GILT, relief="flat", font=("Consolas", 9),
                       cursor="hand2").pack(side="left")
+            tk.Button(backup, text="Set password", command=self.set_password,
+                      bg=PANEL, fg=GILT, relief="flat", font=("Consolas", 9),
+                      cursor="hand2").pack(side="left", padx=(10, 0))
             tk.Label(backup, text="  write the words down \u2014 they are the only way back",
                      bg=PLATE, fg=DIM, font=("Georgia", 9, "italic")).pack(side="left")
         else:
@@ -126,6 +131,37 @@ class WalletApp:
 
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.refresh()
+
+    def set_password(self):
+        """
+        Lock the wallet file with a password.
+
+        Until now anything that could read the folder owned the coins in it --
+        the secret key and the recovery words sat there in plain text. A miner
+        pointed this out and he was right.
+        """
+        pw = simpledialog.askstring("Sosaiem",
+            "Choose a password for this wallet.\n\n"
+            "It encrypts the key and your recovery words on disk.\n"
+            "There is no way to reset it -- if you forget it, only your\n"
+            "17 recovery words can bring the wallet back.",
+            show="*", parent=self.root)
+        if not pw:
+            return
+        again = simpledialog.askstring("Sosaiem", "Type it again:",
+                                       show="*", parent=self.root)
+        if again != pw:
+            messagebox.showerror("Sosaiem", "They did not match.", parent=self.root)
+            return
+        try:
+            self.node.wallet.save_to_file(self.node.wallet_file, password=pw)
+            self.node.wallet_password = pw
+            messagebox.showinfo("Sosaiem",
+                "Wallet locked. You will be asked for this password "
+                "next time you open it.", parent=self.root)
+        except Exception as e:
+            messagebox.showerror("Sosaiem", f"Could not lock the wallet: {e}",
+                                 parent=self.root)
 
     def show_phrase(self):
         phrase = self.node.wallet.phrase
@@ -285,7 +321,33 @@ def main():
         if arg.isdigit():
             port = int(arg)
     ask_restore(port)
-    node = start_node(port)
+
+    # If this wallet is locked, ask before anything else -- the node cannot even
+    # start without the key. Three tries, then stop rather than loop forever.
+    from wallet import Wallet as _W
+    wallet_file = f"wallet_{port}.pem"
+    password = None
+    if os.path.exists(wallet_file) and _W.is_locked(wallet_file):
+        for attempt in range(3):
+            box = tk.Tk(); box.withdraw()
+            pw = simpledialog.askstring(
+                "Sosaiem", "This wallet is password protected.\n\nPassword:",
+                show="*", parent=box)
+            box.destroy()
+            if pw is None:
+                return                      # they cancelled; nothing to do
+            try:
+                _W.load_from_file(wallet_file, password=pw)
+                password = pw
+                break
+            except Exception:
+                if attempt == 2:
+                    err = tk.Tk(); err.withdraw()
+                    messagebox.showerror("Sosaiem", "Wrong password.", parent=err)
+                    err.destroy()
+                    return
+
+    node = start_node(port, password)
     root = tk.Tk()
     WalletApp(root, node)
     root.after(1500, lambda: start_node_network(node))
