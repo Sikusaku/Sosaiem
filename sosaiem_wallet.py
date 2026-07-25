@@ -58,6 +58,8 @@ class WalletApp:
                  font=("Georgia", 15, "bold")).pack(pady=(16, 2))
         tk.Label(root, text="society's coin \u00b7 post-quantum \u00b7 feeless",
                  bg=PLATE, fg=SAGE, font=("Georgia", 9, "italic")).pack()
+        tk.Label(root, text=f"version {core.NODE_VERSION}",
+                 bg=PLATE, fg=SAGE, font=("Consolas", 8)).pack(pady=(2, 0))
 
         addr_box = tk.Frame(root, bg=PLATE)
         addr_box.pack(fill="x", padx=22, pady=(16, 0))
@@ -253,9 +255,9 @@ class WalletApp:
         self.balance.config(text=f"{bal:.6f} SOSA")
         if pend_out > 0:
             self.available.config(text=f"available {bal - pend_out:.6f} \u00b7 "
-                                       f"{pend_out:.6f} awaiting votes")
+                                       f"{pend_out:.6f} sending")
         else:
-            self.available.config(text="your balance is also your voting weight")
+            self.available.config(text="feeless \u00b7 send to anyone, online or not")
         self.feed.config(state="normal")
         self.feed.delete("1.0", "end")
         self.feed.insert("1.0", "\n".join(events) if events else "waiting for activity\u2026")
@@ -263,7 +265,7 @@ class WalletApp:
         self.status.config(text=f"blocks {blocks}  \u00b7  minted {minted:.2f} / "
                                 f"{core.MAX_SUPPLY:,}  \u00b7  validators {validators}"
                                 f"  \u00b7  peers {peers}"
-                                + (f"  \u00b7  {len(pend)} awaiting votes" if pend else ""))
+                                + (f"  \u00b7  {len(pend)} sending" if pend else ""))
         self.root.after(2000, self.refresh)
 
     def close(self):

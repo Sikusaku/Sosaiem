@@ -72,6 +72,8 @@ class MinerApp:
                  font=("Georgia", 15, "bold")).pack(pady=(16, 2))
         tk.Label(root, text="strikes coins to any address \u00b7 holds no keys",
                  bg=PLATE, fg=SAGE, font=("Georgia", 9, "italic")).pack()
+        tk.Label(root, text=f"version {core.NODE_VERSION}",
+                 bg=PLATE, fg=SAGE, font=("Consolas", 8)).pack(pady=(2, 0))
 
         box = tk.Frame(root, bg=PLATE)
         box.pack(fill="x", padx=22, pady=(18, 0))

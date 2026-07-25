@@ -126,7 +126,7 @@ ACTIVE_VALIDATOR_WINDOW = 15 * 60
 # window, faster syncing, bug fixes that only tighten what was already invalid.
 # Nobody has to agree on it and nothing can split over it.
 PROTOCOL_VERSION = 4
-NODE_VERSION = "2.13.0"
+NODE_VERSION = "2.13.1"
 
 # Blocks may carry a small tag naming the build that made them. It is accepted
 # and recorded, never required. A rule that forces everyone onto a particular
@@ -1490,6 +1490,13 @@ def make_handler(node):
                 # cannot be pushed to, so it never received anyone else's work
                 # and every block it won paid only itself. Letting nodes ASK for
                 # shares is what makes the split work for people who cannot host.
+                #
+                # We serve the current tip's shares in the original flat form
+                # (older nodes read only this), PLUS a "recent" list of shares
+                # for the last few tips, each tagged with the tip it was mined
+                # against. A block may legitimately include those recent-tip
+                # shares (the validator accepts the same SHARE_WINDOW), so this
+                # is what lets a slightly-late miner's work actually get paid.
                 with node.lock:
                     node._ensure_share_height()
                     prev = node.cur_shares["prev"]
@@ -1497,7 +1504,19 @@ def make_handler(node):
                     for addr, nonces in node.cur_shares["by"].items():
                         for nc in list(nonces)[:MAX_SHARES_PER_BLOCK]:
                             out.append({"address": addr, "nonce": nc})
-                self._json({"prev_hash": prev, "shares": out[:MAX_SHARES_PER_BLOCK]})
+                    recent = []
+                    for tip_hash, by in list(node.recent_shares.items()):
+                        if tip_hash == prev:
+                            continue
+                        for addr, nonces in by.items():
+                            for nc in list(nonces)[:MAX_SHARES_PER_BLOCK]:
+                                recent.append({"prev_hash": tip_hash,
+                                               "address": addr, "nonce": nc})
+                        if len(recent) >= MAX_SHARES_PER_BLOCK * SHARE_WINDOW:
+                            break
+                self._json({"prev_hash": prev,
+                            "shares": out[:MAX_SHARES_PER_BLOCK],
+                            "recent": recent[:MAX_SHARES_PER_BLOCK * SHARE_WINDOW]})
 
             elif self.path.startswith("/holders"):
                 with node.lock:
@@ -1692,11 +1711,24 @@ def handle_incoming_share(node, s):
     if getattr(node, "seed_only", False):
         with node.lock:
             node._ensure_share_height()
+            # A seed is the collection point most miners can reach, so it must be
+            # at least as forgiving as a normal node about which tip a share was
+            # mined against. Before, it kept only shares matching the *exact*
+            # current tip and dropped everything a step behind -- so a miner that
+            # lagged even one block (slow link to this seed) had its work
+            # silently discarded and was paid almost nothing despite real
+            # hashing. Now it keeps shares for the current tip AND the recent
+            # tips the block validator already accepts (SHARE_WINDOW), so
+            # slightly-late work still counts.
             if prev_hash == node.cur_shares["prev"]:
                 bucket = node.cur_shares["by"].setdefault(addr, set())
                 if len(bucket) < MAX_SHARES_PER_BLOCK and nonce not in bucket:
                     bucket.add(nonce)
                     node.cur_shares["version"] += 1
+            elif prev_hash in node.recent_shares:
+                bucket = node.recent_shares[prev_hash].setdefault(addr, set())
+                if len(bucket) < MAX_SHARES_PER_BLOCK:
+                    bucket.add(nonce)
         gossip(node, "/share", s)
         return "relayed"
 
@@ -2108,30 +2140,61 @@ def pull_shares(node):
     added = 0
     for peer in list(node.peers)[:6]:
         data = get_json(peer.rstrip("/") + "/shares", timeout=3)
-        if not isinstance(data, dict) or data.get("prev_hash") != tip:
+        if not isinstance(data, dict):
             continue
-        for item in (data.get("shares") or [])[:MAX_SHARES_PER_BLOCK]:
+        # current-tip shares: only meaningful if the peer is on our tip
+        if data.get("prev_hash") == tip:
+            for item in (data.get("shares") or [])[:MAX_SHARES_PER_BLOCK]:
+                if not isinstance(item, dict):
+                    continue
+                addr, nonce = item.get("address"), item.get("nonce")
+                if not isinstance(addr, str) or not addr.startswith("SOSA") \
+                        or not isinstance(nonce, int):
+                    continue
+                with node.lock:
+                    if node.cur_shares["prev"] != tip:
+                        return added
+                    bucket = node.cur_shares["by"].setdefault(addr, set())
+                    if nonce in bucket:
+                        continue
+                # only pay for the hash once we know it is new to us
+                if int(share_hash(tip, addr, nonce), 16) >= st:
+                    continue
+                with node.lock:
+                    if node.cur_shares["prev"] == tip:
+                        node.cur_shares["by"].setdefault(addr, set()).add(nonce)
+                        node.cur_shares["version"] += 1
+                        added += 1
+        # recent-tip shares: each carries the tip it was mined against. Accept any
+        # that target a tip we are still tracking -- this is what rescues a
+        # slightly-late miner's work, which the block builder already pays out
+        # for recent tips within the window.
+        for item in (data.get("recent") or [])[:MAX_SHARES_PER_BLOCK * SHARE_WINDOW]:
             if not isinstance(item, dict):
                 continue
-            addr, nonce = item.get("address"), item.get("nonce")
+            rp, addr, nonce = item.get("prev_hash"), item.get("address"), item.get("nonce")
             if not isinstance(addr, str) or not addr.startswith("SOSA") \
-                    or not isinstance(nonce, int):
+                    or not isinstance(nonce, int) or not isinstance(rp, str):
                 continue
             with node.lock:
-                if node.cur_shares["prev"] != tip:
-                    return
-                bucket = node.cur_shares["by"].setdefault(addr, set())
-                if nonce in bucket:
+                on_current = (rp == node.cur_shares["prev"])
+                if not on_current and rp not in node.recent_shares:
+                    continue                       # a tip we are not tracking
+                have = (node.cur_shares["by"] if on_current
+                        else node.recent_shares[rp]).get(addr, set())
+                if nonce in have:
                     continue
-            # only pay for the hash once we know it is new to us
-            if int(share_hash(tip, addr, nonce), 16) >= st:
+            if int(share_hash(rp, addr, nonce), 16) >= st:
                 continue
             with node.lock:
-                if node.cur_shares["prev"] == tip:
+                if rp == node.cur_shares["prev"]:
                     node.cur_shares["by"].setdefault(addr, set()).add(nonce)
                     node.cur_shares["version"] += 1
                     added += 1
-        if added >= MAX_SHARES_PER_BLOCK:
+                elif rp in node.recent_shares:
+                    node.recent_shares[rp].setdefault(addr, set()).add(nonce)
+                    added += 1
+        if added >= MAX_SHARES_PER_BLOCK * 2:
             break
     return added
 
