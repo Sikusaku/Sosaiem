@@ -127,7 +127,7 @@ ACTIVE_VALIDATOR_WINDOW = 15 * 60
 # window, faster syncing, bug fixes that only tighten what was already invalid.
 # Nobody has to agree on it and nothing can split over it.
 PROTOCOL_VERSION = 4
-NODE_VERSION = "2.15.0"
+NODE_VERSION = "2.15.1"
 
 # Blocks may carry a small tag naming the build that made them. It is accepted
 # and recorded, never required. A rule that forces everyone onto a particular
@@ -313,30 +313,39 @@ def sharechain_target(block_target):
 # proportion, every time, no matter who happens to find the block.
 PPLNS_WINDOW = 300
 
+# Uncle inclusion: on a real network with lag, a smaller miner's share can be
+# out-raced -- a bigger miner extends the chain past it before it lands, so it
+# ends up a valid-but-orphaned sibling. Without help those shares count for
+# nothing and small miners get shorted. So a share may reference up to
+# MAX_UNCLES recent orphaned shares; those references are committed into the
+# chain everyone agrees on, and the payout credits uncles too. That is how a
+# share that lost the race still gets paid for its real work.
+MAX_UNCLES = 3
+UNCLE_DEPTH = 12          # an uncle must be within this many heights of the tip
 
-def sharechain_share_id(share_prev, block_prev, address, nonce):
-    """
-    A share-chain share's proof of work AND its identity, in one hash.
 
-    Memory-hard for the same reason ordinary shares are: if it were cheap, a
-    miner with fast hardware could flood the share-chain and skew every payout
-    without real work. Same cost as block-finding, so the share-chain reflects
-    genuine effort only. The result doubles as the id the next share points
-    back at -- that is what links the chain together.
+def sharechain_share_id(share_prev, block_prev, address, nonce, uncles=()):
     """
+    A share-chain share's proof of work AND its identity, in one hash. The
+    uncle references are part of what's hashed, so they're committed -- a miner
+    can't add or swap uncles after the fact without redoing the work.
+    """
+    u = ",".join(uncles)
     return memory_hard(
-        f"SOSA-schain|{share_prev}|{block_prev}|{address}|{nonce}".encode()
+        f"SOSA-schain|{share_prev}|{block_prev}|{address}|{nonce}|{u}".encode()
     )
 
 
-def make_share(share_prev, block_prev, address, nonce):
+def make_share(share_prev, block_prev, address, nonce, uncles=()):
     """Build a share-chain share; its id is derived from its own contents."""
-    sid = sharechain_share_id(share_prev, block_prev, address, nonce)
+    uncles = list(uncles)
+    sid = sharechain_share_id(share_prev, block_prev, address, nonce, uncles)
     return {
         "share_prev": share_prev,
         "block_prev": block_prev,
         "address": address,
         "nonce": nonce,
+        "uncles": uncles,
         "id": sid,
     }
 
@@ -353,6 +362,13 @@ def share_is_well_formed(share):
         return False
     if not isinstance(nc, int):
         return False
+    un = share.get("uncles", [])
+    if not isinstance(un, list) or len(un) > MAX_UNCLES:
+        return False
+    if not all(isinstance(u, str) for u in un):
+        return False
+    if len(set(un)) != len(un):          # no repeated uncle references
+        return False
     return True
 
 
@@ -364,7 +380,8 @@ def share_id_is_valid(share):
     if not share_is_well_formed(share):
         return False
     want = sharechain_share_id(share["share_prev"], share["block_prev"],
-                               share["address"], share["nonce"])
+                               share["address"], share["nonce"],
+                               share.get("uncles", []))
     return share.get("id") == want
 
 
@@ -473,6 +490,28 @@ class ShareChain:
         window.reverse()                      # oldest first
         return window
 
+    def uncle_candidates(self, tip=None, depth=UNCLE_DEPTH, limit=MAX_UNCLES):
+        """
+        Recent shares we hold that are NOT on the main chain from `tip` -- the
+        orphaned siblings that lost the race. A miner references these as uncles
+        so their work still gets paid. Deterministic pick (lowest ids) up to the
+        cap, within `depth` of the tip so only genuinely recent orphans qualify.
+        """
+        t = tip if tip is not None else self.tip
+        if t is None:
+            return []
+        main = self.chain_from_tip(t)
+        on_main = {s["id"] for s in main}
+        referenced = set()
+        for s in main:
+            referenced.update(s.get("uncles", []))
+        tip_h = self.height.get(t, 0)
+        cands = [sid for sid, h in self.height.items()
+                 if sid not in on_main and sid not in referenced
+                 and 0 <= (tip_h - h) <= depth]
+        cands.sort()
+        return cands[:limit]
+
     def prune(self, keep):
         """
         Drop shares far behind the tip -- anything more than `keep` deep. The
@@ -509,9 +548,21 @@ def canonical_payout(share_chain, reward, window=PPLNS_WINDOW, tip=None):
     """
     shares = share_chain.tail(window, tip)      # oldest-first, up to `window`
     counts = {}
+    credited = {s["id"] for s in shares}
     for s in shares:
         a = s["address"]
         counts[a] = counts.get(a, 0) + 1
+        # credit uncles: recent orphaned shares this one references, so a share
+        # that lost the propagation race is still paid for its real work. Each
+        # uncle is credited exactly once, however many shares point at it.
+        for uid in s.get("uncles", []):
+            if uid in credited:
+                continue
+            us = share_chain.shares.get(uid)
+            if us:
+                credited.add(uid)
+                ua = us["address"]
+                counts[ua] = counts.get(ua, 0) + 1
     return split_amounts(reward, counts)
 
 
@@ -527,7 +578,7 @@ def canonical_payout(share_chain, reward, window=PPLNS_WINDOW, tip=None):
 # only after real-node testing). While it is None the rule is off everywhere and
 # the live chain validates exactly as it does today -- the same safe pattern the
 # 4500 transfer switch used.
-SHARECHAIN_ACTIVATION_HEIGHT = 4900
+SHARECHAIN_ACTIVATION_HEIGHT = None
 
 # After activation, this many blocks accept EITHER the old in-block split OR the
 # new share-chain payout -- so no active miner is stranded the instant the rule
@@ -760,6 +811,15 @@ def _check_block_content(transactions, prev_hash, share_target, height=None,
                       else len(rewards) <= 1)
             if not (_matches(canon) or ok_old):
                 return False, 0.0
+        elif phase in ("grace", "hard"):
+            # Rule in force but no share-chain handed to us: this is historical
+            # re-validation (a deep check long after the fact). The canonical
+            # split can't be reconstructed from pruned history, and fair blocks
+            # won't match the old in-block split either, so neither can be
+            # demanded here. Structure, duplicates and totals are still
+            # enforced; the live network enforced the split when the block was
+            # at the tip.
+            pass
         else:
             # Rule off (or share-chain not available to us): original validation,
             # exactly as before -- the live chain is unchanged until activation.
@@ -2166,12 +2226,17 @@ def handle_incoming_share(node, s):
 SHARECHAIN_KEEP = PPLNS_WINDOW + 100   # retain the payout window plus a margin
 
 
+SCHAIN_PENDING_MAX = 500   # shares parked awaiting a parent, across all parents
+
+
 def handle_incoming_schain_share(node, s):
     """
-    Intake for one linked share-chain share. Accept it only if it is
-    well-formed, its id genuinely matches its own contents (real proof of
-    work), it clears the share-chain difficulty, and it links to a share we
-    already hold (or genesis). Then add it to the share-chain and relay it.
+    Intake for one linked share-chain share. Proof and structure are checked,
+    then it is placed in the chain. A share that arrives BEFORE its parent
+    (gossip over a real network is out-of-order all the time) is PARKED and
+    retried the moment the parent lands, instead of being thrown away --
+    dropping those was exactly how a smaller miner's work silently vanished
+    and their node fell permanently behind.
     """
     if not isinstance(s, dict) or not share_id_is_valid(s):
         return "ignored"
@@ -2182,19 +2247,58 @@ def handle_incoming_schain_share(node, s):
         return "ignored"
     if not share_meets_target(s, target):
         return "invalid"
+    newly = []
     with node.lock:
-        known = set(node.share_chain.shares)
-        if not share_link_ok(s, known):
-            # a share whose parent we don't have yet -- can't place it in the
-            # chain (its work isn't lost; a resync will pick up the run in order)
-            return "orphan"
-        added = node.share_chain.add(s)
-        if added:
-            node.share_chain.prune(SHARECHAIN_KEEP)
-    if added:
-        gossip(node, "/schain_share", s)
-        return "accepted"
-    return "duplicate"
+        pend = node.__dict__.setdefault("schain_pending", {})
+        res = _schain_place(node, s, pend, newly)
+    for sh in newly:
+        gossip(node, "/schain_share", sh)
+    return res
+
+
+def _schain_place(node, s, pend, newly):
+    """Place one proven share: park it if the parent is missing; on success,
+    revive every parked descendant that was waiting on it, in order."""
+    sp = s["share_prev"]
+    if sp != SHARECHAIN_GENESIS and not node.share_chain.has(sp):
+        total = sum(len(v) for v in pend.values())
+        bucket = pend.setdefault(sp, [])
+        if total < SCHAIN_PENDING_MAX and all(x["id"] != s["id"] for x in bucket):
+            bucket.append(s)
+        return "pending"
+    st = _schain_add_one(node, s)
+    if st != "accepted":
+        return st
+    newly.append(s)
+    stack = [s["id"]]
+    while stack:
+        pid = stack.pop()
+        for child in pend.pop(pid, []):
+            if _schain_add_one(node, child) == "accepted":
+                newly.append(child)
+                stack.append(child["id"])
+    node.share_chain.prune(SHARECHAIN_KEEP)
+    return "accepted"
+
+
+def _schain_add_one(node, s):
+    """Uncle validation + add for a single share (no parking, no retry)."""
+    known = set(node.share_chain.shares)
+    sp = s["share_prev"]
+    uncles = s.get("uncles", [])
+    if uncles:
+        # each uncle must be a share we hold and NOT an ancestor on this
+        # share's own line (a real orphan, not a replay of the main chain)
+        if sp != SHARECHAIN_GENESIS:
+            ancestors = {x["id"] for x in node.share_chain.chain_from_tip(sp)}
+        else:
+            ancestors = set()
+        for uid in uncles:
+            if uid not in known or uid in ancestors or uid == s["id"]:
+                return "invalid"
+    if not node.share_chain.add(s):
+        return "duplicate"
+    return "accepted"
 
 
 def mine_one_schain_share(node, address, max_tries=200000):
@@ -2208,16 +2312,18 @@ def mine_one_schain_share(node, address, max_tries=200000):
     with node.lock:
         tip = node.share_chain.tip or SHARECHAIN_GENESIS
         block_prev = node.chain.last_block.compute_hash()
+        uncles = node.share_chain.uncle_candidates()
     try:
         target = sharechain_target(next_target(node.chain.chain))
     except Exception:
         return None
     nonce = random.randrange(1 << 62)
     for _ in range(max_tries):
-        sid = sharechain_share_id(tip, block_prev, address, nonce)
+        sid = sharechain_share_id(tip, block_prev, address, nonce, uncles)
         if int(sid, 16) < target:
             share = {"share_prev": tip, "block_prev": block_prev,
-                     "address": address, "nonce": nonce, "id": sid}
+                     "address": address, "nonce": nonce,
+                     "uncles": uncles, "id": sid}
             handle_incoming_schain_share(node, share)
             return share
         nonce += 1
@@ -3415,7 +3521,8 @@ def _mine_one_block_racing(node):
     # attempt, reusing the nonce, instead of a whole second mining loop. `sc_tip`
     # is refreshed as our shares land so each new one chains onto the latest.
     sc_target = sharechain_target(target)
-    sc = {"tip": (node.share_chain.tip or SHARECHAIN_GENESIS)}
+    sc = {"tip": (node.share_chain.tip or SHARECHAIN_GENESIS),
+          "uncles": node.share_chain.uncle_candidates()}
     schain_box = []
 
     def worker(slot):
@@ -3435,12 +3542,14 @@ def _mine_one_block_racing(node):
                     share_box.append(sn)
             # a share-chain attempt -- one extra hash, reusing this same nonce,
             # so the share-chain fills at the natural rate with no second loop
-            sc_id = sharechain_share_id(sc["tip"], prev_hash, my_addr, sn)
+            sc_id = sharechain_share_id(sc["tip"], prev_hash, my_addr, sn,
+                                        sc["uncles"])
             if int(sc_id, 16) < sc_target:
                 with box_lock:
                     schain_box.append({"share_prev": sc["tip"],
                                        "block_prev": prev_hash,
                                        "address": my_addr, "nonce": sn,
+                                       "uncles": sc["uncles"],
                                        "id": sc_id})
             # a block attempt -- every worker walks a different lane of nonces
             blk.nonce = nb
@@ -3525,9 +3634,17 @@ def _mine_one_block_racing(node):
                 handle_incoming_schain_share(node, sh)
             except Exception:
                 pass
-        if fresh_sc:
+        with node.lock:
+            cur_tip = node.share_chain.tip or SHARECHAIN_GENESIS
+        if cur_tip != sc["tip"]:
+            # The tip moved -- our share landed, or someone else's arrived over
+            # the network. Rebase IMMEDIATELY so we don't keep mining on a
+            # stale tip that will only orphan. Only rebasing when our own share
+            # landed was exactly how a smaller miner's whole output turned into
+            # invisible orphans while a faster miner extended the chain.
             with node.lock:
                 sc["tip"] = node.share_chain.tip or SHARECHAIN_GENESIS
+                sc["uncles"] = node.share_chain.uncle_candidates()
         fresh_shares = []
 
         found = found_block is not None

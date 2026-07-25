@@ -5,7 +5,7 @@ its own blockchain, its own consensus, no dependency on another chain. It is
 open-source so anyone can read exactly how it works and verify there is nothing
 hidden.
 
-Current build: **2.15.0** · consensus protocol **v4** · target block time **60s** ·
+Current build: **2.15.1** · consensus protocol **v4** · target block time **60s** ·
 block reward **1.66666667 SOSA** · max supply **12,212,010 SOSA**.
 
 ## What makes it different
