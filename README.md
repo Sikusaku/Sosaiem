@@ -5,31 +5,36 @@ its own blockchain, its own consensus, no dependency on another chain. It is
 open-source so anyone can read exactly how it works and verify there is nothing
 hidden.
 
-Current build: **2.11.3** · consensus protocol **v2** · target block time **60s** ·
+Current build: **2.13.0** · consensus protocol **v4** · target block time **60s** ·
 block reward **1.66666667 SOSA** · max supply **12,212,010 SOSA**.
 
-## How rewards work (fair, no owner)
+## What makes it different
 
-Mining reward for each block is **split proportionally among everyone whose work-shares
-are in that block** — the more work you did, the bigger your slice. There is **no pool
-owner and no custody**: rewards go straight from each block to each miner's own wallet.
-A slower miner's shares stay claimable for several blocks, so honest work isn't thrown
-away just for arriving a moment late.
+- **ASIC-resistant mining.** Proof-of-work is memory-hard (scrypt, 8 MB per attempt),
+  so it stays mineable on a normal PC instead of turning into a specialised-hardware
+  race.
+- **No pool operator.** Miners submit verifiable work-shares and each block's reward is
+  split proportionally across everyone's shares; every node re-checks the maths. You get
+  a fair cut of the work you did, with no operator taking a slice.
+- **Feeless, offline-capable transfers.** To send, your own device does a few seconds of
+  proof-of-work on the payment (no fee), and the chain settles it into a block. A
+  transfer completes even if the recipient — or everyone else — is offline, and it
+  settles in a block or two (about a minute). Dependable rather than instant.
+- **Post-quantum from genesis.** Signatures use ML-DSA (NIST FIPS 204), so the network
+  is secure against quantum computers from its first block.
+- **No premine, no founder cut, no KYC.** Every coin is mined in the open.
 
 ## Running it
 
-Requires Python 3. No packages to install — everything uses the standard library.
+Requires Python 3. Standard library only — nothing to install.
 
 - **Run a node:** `python sosaiem_node.py 80`
-- **Mine:** run the miner app and point it at your wallet address.
-- **Wallet:** run the wallet app to hold and send SOSA.
+- **Mine / wallet:** run the miner and wallet apps (one-click `.exe` on Windows via
+  `build_exe.bat`, or run the Python directly on Mac/Linux).
 
-On Windows you can build click-to-run `.exe` files with `build_exe.bat`, and start
-things with `start_miner.bat` / `start_wallet.bat`.
-
-Nodes try to make themselves reachable automatically (UPnP via `portmap.py`) and find
-each other through decentralized relays (Nostr via `nostrseed.py`), so the network does
-not depend on any single server.
+Nodes make themselves reachable automatically where possible (UPnP via `portmap.py`) and
+find each other through decentralized relays (Nostr via `nostrseed.py`), so the network
+does not depend on any single server.
 
 ## Files
 
@@ -47,5 +52,6 @@ not depend on any single server.
 
 ## Note
 
-This is a young, community-run project. The code here is the version currently live on
-the network. Treat it as experimental software.
+This is a young, community-run project — experimental software. Transfers settle inside
+blocks, which relies on mining continuing; securing them beyond the mining era (~14
+years out) is an open question the project intends to address before then.

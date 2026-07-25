@@ -115,22 +115,43 @@ class WalletApp:
 
         backup = tk.Frame(root, bg=PLATE)
         backup.pack(fill="x", padx=22, pady=(6, 12))
+        # Buttons live on their own row; the hint text goes on a full-width line
+        # BELOW them. Packing all of it side-by-side made the italic hint run
+        # into the buttons on a narrow window -- the overlap people were seeing.
+        row = tk.Frame(backup, bg=PLATE)
+        row.pack(fill="x", anchor="w")
         if node.wallet.has_phrase():
-            tk.Button(backup, text="Show recovery phrase", command=self.show_phrase,
+            tk.Button(row, text="Show recovery phrase", command=self.show_phrase,
                       bg=PANEL, fg=GILT, relief="flat", font=("Consolas", 9),
                       cursor="hand2").pack(side="left")
-            tk.Button(backup, text="Set password", command=self.set_password,
+            tk.Button(row, text="Set password", command=self.set_password,
                       bg=PANEL, fg=GILT, relief="flat", font=("Consolas", 9),
                       cursor="hand2").pack(side="left", padx=(10, 0))
-            tk.Label(backup, text="  write the words down \u2014 they are the only way back",
-                     bg=PLATE, fg=DIM, font=("Georgia", 9, "italic")).pack(side="left")
+            tk.Button(row, text="Block explorer", command=self.open_explorer,
+                      bg=PANEL, fg=GILT2, relief="flat", font=("Consolas", 9),
+                      cursor="hand2").pack(side="left", padx=(10, 0))
+            tk.Label(backup, text="write the words down \u2014 they are the only way back",
+                     bg=PLATE, fg=DIM, font=("Georgia", 9, "italic"),
+                     anchor="w").pack(fill="x", anchor="w", pady=(4, 0))
         else:
+            tk.Button(row, text="Block explorer", command=self.open_explorer,
+                      bg=PANEL, fg=GILT2, relief="flat", font=("Consolas", 9),
+                      cursor="hand2").pack(side="left")
             tk.Label(backup, text=f"No recovery phrase \u2014 back up {node.wallet_file}, "
                                   "that file IS your coins.",
-                     bg=PLATE, fg=RED, font=("Georgia", 9, "italic")).pack(side="left")
+                     bg=PLATE, fg=RED, font=("Georgia", 9, "italic"),
+                     anchor="w").pack(fill="x", anchor="w", pady=(4, 0))
 
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.refresh()
+
+    def open_explorer(self):
+        """
+        Open the public block explorer in the browser so people can look up
+        blocks and transfers straight from the wallet. Suggested by a miner --
+        having the ledger one click away makes the coin easy to verify.
+        """
+        webbrowser.open("https://sosaiem.com/network.html")
 
     def set_password(self):
         """

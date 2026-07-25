@@ -16,7 +16,13 @@ MAX_SUPPLY = 12_212_010
 
 
 def _canonical(tx: dict) -> str:
-    core = {k: tx[k] for k in tx if k != "signature"}
+    # The signature and the send-time work stamp are BOTH excluded from what
+    # gets signed. The signature obviously can't sign itself; the work stamp
+    # (work_nonce) is added after signing and is bound to the signature by its
+    # own hash, so it must not change the signed content -- otherwise stamping a
+    # transfer would break its signature. Old transfers never had a work_nonce,
+    # so excluding it leaves every existing signature valid.
+    core = {k: tx[k] for k in tx if k not in ("signature", "work_nonce")}
     return json.dumps(core, sort_keys=True)
 
 

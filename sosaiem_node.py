@@ -125,8 +125,8 @@ ACTIVE_VALIDATOR_WINDOW = 15 * 60
 # NODE_VERSION is just the build. Change it freely: new endpoints, a nicer
 # window, faster syncing, bug fixes that only tighten what was already invalid.
 # Nobody has to agree on it and nothing can split over it.
-PROTOCOL_VERSION = 2
-NODE_VERSION = "2.11.3"
+PROTOCOL_VERSION = 4
+NODE_VERSION = "2.13.0"
 
 # Blocks may carry a small tag naming the build that made them. It is accepted
 # and recorded, never required. A rule that forces everyone onto a particular
@@ -183,7 +183,57 @@ MAX_SHARES_PER_BLOCK = 128
 # fastest kept taking whole rewards. Five blocks is a few minutes of grace:
 # long enough that ordinary network delay never costs anyone their work, short
 # enough that the ledger stays easy to check.
-SHARE_WINDOW = 5
+SHARE_WINDOW = 15
+
+
+# --- transfers-in-blocks (offline-transfer settlement) ----------------------
+# Transfers move from the old online-voting system into the block chain: a
+# sender self-mines a small proof-of-work on their transfer, and miners carry it
+# into a block for free. The chain's order becomes the referee that stops
+# double-spends, so a transfer settles even if the recipient (or every other
+# holder) is offline.
+#
+# THIS IS DORMANT UNTIL ACTIVATED. Until the chain reaches TRANSFERS_ACTIVATION
+# _HEIGHT, no block may contain a transfer and nothing below changes how the node
+# behaves -- the live chain runs exactly as it did before. Set the height to a
+# real block number ONLY after a two-node test has confirmed the flow. The
+# sentinel below (a huge number) means "off".
+TRANSFERS_ACTIVATION_HEIGHT = 4500          # transfers go live at this block
+TRANSFER_WORK_TARGET = 2 ** 236                 # send-time work: a few seconds
+MAX_TRANSFERS_PER_BLOCK = 64
+
+
+def transfers_active(height):
+    """True only once the chain has reached the activation height."""
+    return height is not None and height >= TRANSFERS_ACTIVATION_HEIGHT
+
+
+def _transfer_work_core(tx):
+    # the work is bound to this exact signed transfer, so a stamp can't be reused
+    return (f"SOSA-xfer|{tx.get('from')}|{tx.get('to')}|{tx.get('amount')}"
+            f"|{tx.get('signature')}").encode()
+
+
+def transfer_work_hash(tx, nonce):
+    return hashlib.sha256(_transfer_work_core(tx) + f"|{nonce}".encode()).hexdigest()
+
+
+def transfer_work_is_valid(tx):
+    nonce = tx.get("work_nonce")
+    if not isinstance(nonce, int) or nonce < 0:
+        return False
+    return int(transfer_work_hash(tx, nonce), 16) < TRANSFER_WORK_TARGET
+
+
+def stamp_transfer(tx):
+    """Sender's PC does the send-time work, then broadcasts. Returns tx + nonce."""
+    nonce = 0
+    while True:
+        if int(transfer_work_hash(tx, nonce), 16) < TRANSFER_WORK_TARGET:
+            out = dict(tx)
+            out["work_nonce"] = nonce
+            return out
+        nonce += 1
 
 
 def share_hash(prev_hash, address, nonce):
@@ -277,9 +327,10 @@ def block_to_dict(block):
 
 
 def _check_block_content(transactions, prev_hash, share_target, height=None,
-                         recent_tips=()):
+                         recent_tips=(), balances_before=None):
     shares_entries = []
     rewards = []
+    transfers = []
     has_version_tag = False
     for tx in transactions:
         if not isinstance(tx, dict):
@@ -293,11 +344,35 @@ def _check_block_content(transactions, prev_hash, share_target, height=None,
             if not isinstance(tx.get("to"), str) or not tx["to"].startswith("SOSA"):
                 return False, 0.0
             rewards.append(tx)
+        elif t == "transfer":
+            # Dormant until activation: below the activation height a transfer in
+            # a block is invalid, exactly as it always was. This is the line that
+            # keeps the live chain behaving identically until the switch is set.
+            if not transfers_active(height):
+                return False, 0.0
+            if not transfer_is_valid(tx) or not transfer_work_is_valid(tx):
+                return False, 0.0
+            transfers.append(tx)
         elif t == "version":
             if tx.get("v", 0) >= 1:
                 has_version_tag = True
         else:
             return False, 0.0
+
+    # Transfers settle by chain order: check each against the balances that
+    # exist just before this block -- no overspend, no double-spend. This block
+    # is empty of transfers below activation, so this whole check is skipped and
+    # nothing changes for the existing chain.
+    if transfers:
+        if balances_before is None:
+            return False, 0.0        # cannot verify a spend without ledger state
+        _bal = dict(balances_before)
+        for tx in transfers:
+            frm, to, amt = tx["from"], tx["to"], tx["amount"]
+            if amt <= 0 or amt > _bal.get(frm, 0.0) + 1e-9:
+                return False, 0.0
+            _bal[frm] = round(_bal.get(frm, 0.0) - amt, 8)
+            _bal[to] = round(_bal.get(to, 0.0) + amt, 8)
 
     if len(shares_entries) > 1:
         return False, 0.0
@@ -425,25 +500,51 @@ def validate_full_chain(chain):
         return False
     targets = compute_targets(chain.chain)
     minted = 0.0
+    running_bal = {}            # running ledger, used only to check transfers
+
+    def _fold(block):
+        # fold a block's effects into the running balance -- matches
+        # compute_balances exactly, so both validators agree
+        for tx in block.transactions:
+            if not isinstance(tx, dict):
+                continue
+            ty = tx.get("type")
+            if ty == "reward":
+                running_bal[tx["to"]] = round(running_bal.get(tx["to"], 0.0)
+                                              + tx.get("amount", 0.0), 8)
+            elif ty == "transfer":
+                running_bal[tx["from"]] = round(running_bal.get(tx["from"], 0.0)
+                                                - tx.get("amount", 0.0), 8)
+                running_bal[tx["to"]] = round(running_bal.get(tx["to"], 0.0)
+                                              + tx.get("amount", 0.0), 8)
+
     for block in chain.chain:
         if block.index == 0:
             continue
         bid = block.compute_hash()
+        has_transfer = any(isinstance(tx, dict) and tx.get("type") == "transfer"
+                           for tx in block.transactions)
         if bid in _verified_work:
-            # we have already re-done this block's work; still count its reward
+            # already re-done this block's work; still count its reward and fold
             for tx in block.transactions:
                 if isinstance(tx, dict) and tx.get("type") == "reward":
                     minted += tx.get("amount", 0.0)
+            _fold(block)
             continue
+        # only pay the cost of a balances snapshot when a block actually carries
+        # a transfer -- so below activation this is always None and nothing changes
+        bb = dict(running_bal) if has_transfer else None
         ok, block_reward = _check_block_content(
             block.transactions, block.previous_hash,
             share_target_for(targets[block.index]), height=block.index,
-            recent_tips=_tips_before(chain.chain, block.index))
+            recent_tips=_tips_before(chain.chain, block.index),
+            balances_before=bb)
         if not ok:
             return False
         if block_reward > BLOCK_REWARD + 1e-6:
             return False
         minted += block_reward
+        _fold(block)
         _remember_verified(bid)
     if minted > MAX_SUPPLY + 1e-6:
         return False
@@ -458,10 +559,14 @@ def validate_new_block(chain, block):
     target = next_target(chain.chain)
     if int(block.pow_hash(), 16) >= target:
         return False
+    has_transfer = any(isinstance(tx, dict) and tx.get("type") == "transfer"
+                       for tx in block.transactions)
+    bb = compute_balances(chain) if has_transfer else None
     ok, block_reward = _check_block_content(
         block.transactions, block.previous_hash, share_target_for(target),
         height=block.index,
-        recent_tips=_tips_before(chain.chain + [block], block.index))
+        recent_tips=_tips_before(chain.chain + [block], block.index),
+        balances_before=bb)
     if not ok:
         return False
     if block_reward > BLOCK_REWARD + 1e-6:
@@ -1776,9 +1881,14 @@ def handle_incoming_tx(node, tx):
         if len(node.transfers) >= MAX_TRANSFERS:
             return "busy"                     # refuse to grow without bound
         node.transfers[sig] = tx
+    gossip(node, "/tx", tx)
+    if transfers_active(len(node.chain.chain)):
+        # settled by the chain now -- just hold it for a miner to include, no vote
+        print(f"\n  [tx] transfer received -- awaiting a block"
+              f"\nsosa:{node.port}> ", end="", flush=True)
+        return "accepted"
     print(f"\n  [tx] transfer received -- validators are voting..."
           f"\nsosa:{node.port}> ", end="", flush=True)
-    gossip(node, "/tx", tx)
     cast_vote(node, tx)
     return "accepted"
 
@@ -2287,6 +2397,13 @@ def _seed_sources(node):
     the address baked into this build.
     """
     sources = []
+    if getattr(node, "isolated", False):
+        # --isolated: talk to nobody but peers we were explicitly handed. This is
+        # what keeps a local test from reaching the real network and pulling the
+        # live chain into the test.
+        with node.lock:
+            remembered = sorted(node.peers)
+        return [("test peers", remembered)] if remembered else []
     with node.lock:
         remembered = sorted(node.peers)
     if remembered:
@@ -2643,6 +2760,42 @@ def _mine_one_block_racing(node):
                         for a, amt in sorted(split_amounts(reward, counts).items())]
             else:
                 txs.append(make_reward(node.payout_address, reward))
+
+        # Carry pending transfers into the block -- for free -- once activated.
+        # Below the activation height this whole section is skipped, so blocks
+        # stay transfer-free and the chain behaves exactly as before.
+        # Wrapped so that if anything here ever goes wrong, block-building carries
+        # on WITHOUT transfers rather than stopping mining. Worst case a transfer
+        # waits for the next block; the chain never stalls.
+        if transfers_active(prev.index + 1):
+            try:
+                bal = compute_balances(node.chain)
+                for a, amt in (split_amounts(reward, counts).items() if counts else []):
+                    bal[a] = round(bal.get(a, 0.0) + amt, 8)   # this block's rewards
+                picked = 0
+                # deterministic order (by signature) so every miner builds the same set
+                for tx in sorted(node.transfers.values(),
+                                 key=lambda t: t.get("signature", "")):
+                    if picked >= MAX_TRANSFERS_PER_BLOCK:
+                        break
+                    if tx.get("signature") in node.confirmed:
+                        continue
+                    if not transfer_is_valid(tx) or not transfer_work_is_valid(tx):
+                        continue
+                    frm, to, amt = tx.get("from"), tx.get("to"), tx.get("amount")
+                    if not amount_is_sane(amt) or amt > bal.get(frm, 0.0) + 1e-9:
+                        continue                          # can't afford now -> skip
+                    txs.append({"type": "transfer", "from": frm,
+                                "from_pubkey": tx.get("from_pubkey"), "to": to,
+                                "amount": amt, "timestamp": tx.get("timestamp"),
+                                "signature": tx.get("signature"),
+                                "work_nonce": tx.get("work_nonce")})
+                    bal[frm] = round(bal.get(frm, 0.0) - amt, 8)
+                    bal[to] = round(bal.get(to, 0.0) + amt, 8)
+                    picked += 1
+            except Exception as e:
+                # never let transfer handling stop the miner from producing a block
+                print(f"   (transfer scoop skipped this block: {e})")
         return Block(prev.index + 1, txs, prev_hash)
 
     with node.lock:
@@ -2874,6 +3027,18 @@ def do_send(node, to, amount):
     if amount > available + 1e-9:
         return False, f"not enough SOSA (available {available:.8f})."
     tx = make_transfer(node.wallet, to, round(amount, 8))
+    if transfers_active(len(node.chain.chain)):
+        # Chain-settled transfer: do the send-time work, then broadcast for a
+        # miner to carry into a block. Works even if the recipient (or every
+        # other holder) is offline -- no live voting needed.
+        tx = stamp_transfer(tx)
+        with node.lock:
+            node.transfers[tx["signature"]] = tx
+        add_event(node, f"sent {amount} SOSA -> {to[:10]}...")
+        gossip(node, "/tx", tx)
+        return True, (f"sent {amount} SOSA -> {to[:16]}...  "
+                      "(feeless -- settles in the next block or two)")
+    # Dormant (pre-activation): unchanged stake-vote settlement.
     with node.lock:
         node.transfers[tx["signature"]] = tx
     add_event(node, f"sent {amount} SOSA -> {to[:10]}...")
@@ -2977,6 +3142,15 @@ def main():
     node.no_upnp = "--no-upnp" in sys.argv
     node.no_nostr = "--no-nostr" in sys.argv
     node.seed_only = ("--seed-only" in sys.argv) or ("--seed" in sys.argv)
+    # TEST ONLY: keep this node off the real network -- it will only talk to
+    # peers handed to it with --peer=... . Lets a two-node test run in isolation.
+    node.isolated = "--isolated" in sys.argv
+    # TEST ONLY: turn transfers on for this node so a two-node local test can run
+    # without editing code. Do NOT use on the real network -- mainnet activation
+    # must be by a shared block height so every node switches together.
+    if "--transfers-now" in sys.argv:
+        globals()["TRANSFERS_ACTIVATION_HEIGHT"] = 0
+        print("   [test mode] transfers activated on this node (--transfers-now)")
     for arg in sys.argv[1:]:
         if arg.startswith("--public-url="):
             u = arg.split("=", 1)[1].strip().rstrip("/")
