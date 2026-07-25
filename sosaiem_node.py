@@ -5,6 +5,7 @@ import os
 import json
 import time
 import uuid
+import random
 import socket
 import hashlib
 import threading
@@ -126,7 +127,7 @@ ACTIVE_VALIDATOR_WINDOW = 15 * 60
 # window, faster syncing, bug fixes that only tighten what was already invalid.
 # Nobody has to agree on it and nothing can split over it.
 PROTOCOL_VERSION = 4
-NODE_VERSION = "2.13.1"
+NODE_VERSION = "2.15.0"
 
 # Blocks may carry a small tag naming the build that made them. It is accepted
 # and recorded, never required. A rule that forces everyone onto a particular
@@ -272,6 +273,315 @@ def split_amounts(reward, counts):
     return {a: amt for a, amt in out.items() if amt > 0}
 
 
+# ---------------------------------------------------------------------------
+# SHARE-CHAIN -- step 1: format + proof/id hash + link validation.
+#
+# Shares are becoming a chain of their own. Each share names the share before
+# it, so the whole record of who-worked links together and no single miner can
+# quietly leave others out of the payout. This block adds only the foundation:
+# the share format, the memory-hard hash that is both its proof of work and its
+# identity, and the check that a share links to one we already know.
+#
+# NOTHING here is wired into live consensus. These are standalone pieces,
+# proven in isolation first, exactly the way the transfer logic was built and
+# tested before anything depended on it. The live chain behaves identically.
+# ---------------------------------------------------------------------------
+
+SHARECHAIN_GENESIS = "0" * 64   # the share_prev that a first-ever share names
+
+# SHARE-CHAIN -- step 3: difficulty. Rather than give shares their own
+# timestamp-based retarget (which a miner could skew with fake times), the
+# share-chain difficulty rides the block difficulty, which already retargets
+# itself to a steady 60s. A share is this many times easier to find than a
+# block; at a 60s block that lands a share roughly every 3s across the whole
+# network -- a fine-grained, continuous record of who is working. Because it is
+# derived from the block target, it adjusts automatically as hashrate comes and
+# goes, and there is nothing here a miner can lie about.
+SHARECHAIN_EASE = 20
+
+
+def sharechain_target(block_target):
+    """The share-chain proof target, derived from the current block target."""
+    return min(block_target * SHARECHAIN_EASE, MAX_TARGET)
+
+
+# SHARE-CHAIN -- step 4: how far back the payout looks. A block's reward is
+# split across the last PPLNS_WINDOW shares in the share-chain. At ~3s a share
+# that is about this many minutes of recent work -- long enough that a single
+# lucky block doesn't decide everything, short enough that payouts track what
+# people are doing now. Everyone who worked in the window gets paid in
+# proportion, every time, no matter who happens to find the block.
+PPLNS_WINDOW = 300
+
+
+def sharechain_share_id(share_prev, block_prev, address, nonce):
+    """
+    A share-chain share's proof of work AND its identity, in one hash.
+
+    Memory-hard for the same reason ordinary shares are: if it were cheap, a
+    miner with fast hardware could flood the share-chain and skew every payout
+    without real work. Same cost as block-finding, so the share-chain reflects
+    genuine effort only. The result doubles as the id the next share points
+    back at -- that is what links the chain together.
+    """
+    return memory_hard(
+        f"SOSA-schain|{share_prev}|{block_prev}|{address}|{nonce}".encode()
+    )
+
+
+def make_share(share_prev, block_prev, address, nonce):
+    """Build a share-chain share; its id is derived from its own contents."""
+    sid = sharechain_share_id(share_prev, block_prev, address, nonce)
+    return {
+        "share_prev": share_prev,
+        "block_prev": block_prev,
+        "address": address,
+        "nonce": nonce,
+        "id": sid,
+    }
+
+
+def share_is_well_formed(share):
+    """Structural check: the fields exist with the right types."""
+    if not isinstance(share, dict):
+        return False
+    sp, bp = share.get("share_prev"), share.get("block_prev")
+    ad, nc = share.get("address"), share.get("nonce")
+    if not isinstance(sp, str) or not isinstance(bp, str):
+        return False
+    if not isinstance(ad, str) or not ad.startswith("SOSA"):
+        return False
+    if not isinstance(nc, int):
+        return False
+    return True
+
+
+def share_id_is_valid(share):
+    """
+    The stored id must equal the hash of the share's own contents, so a share
+    cannot lie about its identity or claim work it did not do.
+    """
+    if not share_is_well_formed(share):
+        return False
+    want = sharechain_share_id(share["share_prev"], share["block_prev"],
+                               share["address"], share["nonce"])
+    return share.get("id") == want
+
+
+def share_meets_target(share, share_chain_target):
+    """The proof: the share's own hash must fall under the share-chain target."""
+    if not share_id_is_valid(share):
+        return False
+    return int(share["id"], 16) < share_chain_target
+
+
+def share_link_ok(share, known_ids):
+    """
+    The link check: a share must point at a share we already know (its parent
+    in the share-chain), or at the genesis sentinel if it is the very first.
+    `known_ids` is the set of share ids currently in the share-chain.
+    """
+    if not share_is_well_formed(share):
+        return False
+    sp = share["share_prev"]
+    if sp == SHARECHAIN_GENESIS:
+        return True
+    return sp in known_ids
+
+
+# ---------------------------------------------------------------------------
+# SHARE-CHAIN -- step 2: the store, heaviest-chain selection, reorg, pruning.
+#
+# Shares now link into a chain; this holds that chain. The rule that makes the
+# whole fix work lives here: the tip is whichever share sits at the end of the
+# HEAVIEST branch (the most cumulative work). An honest chain that includes
+# everyone's shares out-weighs any one miner's lonely self-only chain, so the
+# lonely chain loses and orphans -- which is what stops a dominant miner from
+# leaving people out. The tie-break is deterministic (by id), so every node,
+# whatever order shares arrive in, agrees on the same tip.
+#
+# Still standalone: no live path builds or reads a ShareChain yet.
+# ---------------------------------------------------------------------------
+
+class ShareChain:
+    def __init__(self):
+        self.shares = {}      # id -> share dict
+        self.work = {}        # id -> this share's own work weight
+        self.cum = {}         # id -> cumulative work from genesis through this id
+        self.height = {}      # id -> number of shares from genesis through this id
+        self.tip = None       # id at the end of the heaviest branch (or None)
+
+    def has(self, sid):
+        return sid in self.shares
+
+    def _heavier(self, a, b):
+        """Is share `a` a strictly better tip than share `b`? More cumulative
+        work wins; on an exact tie the smaller id wins, so the choice is the
+        same on every node regardless of arrival order."""
+        if b is None:
+            return True
+        ca, cb = self.cum[a], self.cum[b]
+        if ca != cb:
+            return ca > cb
+        return a < b
+
+    def add(self, share, work=1):
+        """
+        Add one share. It must be well-formed, carry a valid id (its own proof),
+        and link to a parent we already hold (or genesis). Returns True if it
+        was accepted, False if rejected. Updates the tip -- which is how a
+        heavier branch quietly takes over (a reorg): the tip simply becomes
+        whichever leaf now has the most cumulative work.
+        """
+        if not share_id_is_valid(share):
+            return False
+        sid = share["id"]
+        if sid in self.shares:
+            return False                       # already have it
+        sp = share["share_prev"]
+        if sp == SHARECHAIN_GENESIS:
+            base_cum, base_h = 0, 0
+        elif sp in self.shares:
+            base_cum, base_h = self.cum[sp], self.height[sp]
+        else:
+            return False                       # orphan: parent unknown
+        self.shares[sid] = share
+        self.work[sid] = work
+        self.cum[sid] = base_cum + work
+        self.height[sid] = base_h + 1
+        if self._heavier(sid, self.tip):
+            self.tip = sid
+        return True
+
+    def chain_from_tip(self, sid=None):
+        """The shares from the tip (or a given id) back to genesis, tip first.
+        This is the canonical chain everyone agrees on."""
+        cur = sid if sid is not None else self.tip
+        out = []
+        while cur is not None and cur in self.shares:
+            s = self.shares[cur]
+            out.append(s)
+            nxt = s["share_prev"]
+            cur = nxt if nxt != SHARECHAIN_GENESIS else None
+        return out
+
+    def tail(self, n, sid=None):
+        """The last `n` shares ending at the tip (or given id), oldest first.
+        This is the window a payout is computed over (used in step 4)."""
+        chain = self.chain_from_tip(sid)      # tip-first
+        window = chain[:n]                    # the n nearest the tip
+        window.reverse()                      # oldest first
+        return window
+
+    def prune(self, keep):
+        """
+        Drop shares far behind the tip -- anything more than `keep` deep. The
+        payout window plus a safety margin stays; ancient shares that can never
+        affect a payout again are discarded so the store doesn't grow forever.
+        Shares still on the path to the tip within `keep` are always retained.
+        """
+        if self.tip is None:
+            return 0
+        cutoff = self.height[self.tip] - keep
+        if cutoff <= 0:
+            return 0
+        drop = [sid for sid, h in self.height.items() if h < cutoff]
+        for sid in drop:
+            self.shares.pop(sid, None)
+            self.work.pop(sid, None)
+            self.cum.pop(sid, None)
+            self.height.pop(sid, None)
+        return len(drop)
+
+
+def canonical_payout(share_chain, reward, window=PPLNS_WINDOW, tip=None):
+    """
+    The fair split of a block reward -- computed from the share-chain itself,
+    not chosen by whoever found the block.
+
+    Take the last `window` shares ending at the tip, count how many each
+    address contributed, and split the reward in proportion. Because every node
+    holds the same share-chain and this is deterministic, every node arrives at
+    the exact same payout. The block finder does not get to decide it. A block
+    whose reward transactions don't equal this canonical split is rejected
+    (step 5) -- which is precisely what forces a winner to pay everyone their
+    real share and makes hoarding impossible.
+    """
+    shares = share_chain.tail(window, tip)      # oldest-first, up to `window`
+    counts = {}
+    for s in shares:
+        a = s["address"]
+        counts[a] = counts.get(a, 0) + 1
+    return split_amounts(reward, counts)
+
+
+# SHARE-CHAIN -- step 5: the forcing rule, and its activation switch.
+#
+# When active, a block's reward transactions MUST equal the canonical payout
+# derived from the share-chain. A block that pays anyone differently -- a
+# hoarder paying only itself, most of all -- is rejected by every node. That is
+# the whole point: the winner no longer chooses who gets paid, so hoarding
+# stops being possible rather than merely discouraged.
+#
+# It is dormant until SHARECHAIN_ACTIVATION_HEIGHT is set (at ship time, step 8,
+# only after real-node testing). While it is None the rule is off everywhere and
+# the live chain validates exactly as it does today -- the same safe pattern the
+# 4500 transfer switch used.
+SHARECHAIN_ACTIVATION_HEIGHT = 4900
+
+# After activation, this many blocks accept EITHER the old in-block split OR the
+# new share-chain payout -- so no active miner is stranded the instant the rule
+# turns on while word of the update spreads. After the grace window it goes
+# hard: only the fair share-chain payout is valid, and a hoarding block is
+# rejected for good. This is the gentle cutover we chose.
+SHARECHAIN_GRACE_BLOCKS = 100
+
+
+def sharechain_active(height):
+    h = SHARECHAIN_ACTIVATION_HEIGHT
+    return h is not None and height is not None and height >= h
+
+
+def sharechain_phase(height):
+    """'off' before activation, 'grace' during the soft window, 'hard' after."""
+    h = SHARECHAIN_ACTIVATION_HEIGHT
+    if h is None or height is None or height < h:
+        return "off"
+    if height < h + SHARECHAIN_GRACE_BLOCKS:
+        return "grace"
+    return "hard"
+
+
+def block_payout_is_valid(reward_txs, share_chain, reward, height,
+                          window=PPLNS_WINDOW, tip=None):
+    """
+    The forcing rule. Below the activation height it is a no-op (old validation
+    stands, chain unchanged). At/after it, the block's reward transactions must
+    match the canonical payout from the share-chain exactly -- same payees, same
+    amounts. Anything else is rejected.
+    """
+    if not sharechain_active(height):
+        return True
+    expected = canonical_payout(share_chain, reward, window=window, tip=tip)
+    got = {}
+    for tx in reward_txs:
+        if not isinstance(tx, dict):
+            return False
+        to, amt = tx.get("to"), tx.get("amount")
+        if not isinstance(to, str) or not isinstance(amt, (int, float)):
+            return False
+        if to in got:
+            return False                      # a payee listed twice
+        got[to] = round(amt, 8)
+    if set(got) != set(expected):
+        return False                          # someone owed was left out, or
+                                              # someone not owed was slipped in
+    for a, amt in expected.items():
+        if abs(got[a] - amt) > 1e-7:
+            return False                      # right people, wrong amounts
+    return True
+
+
 def get_lan_ip():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -327,7 +637,7 @@ def block_to_dict(block):
 
 
 def _check_block_content(transactions, prev_hash, share_target, height=None,
-                         recent_tips=(), balances_before=None):
+                         recent_tips=(), balances_before=None, share_chain=None):
     shares_entries = []
     rewards = []
     transfers = []
@@ -412,21 +722,53 @@ def _check_block_content(transactions, prev_hash, share_target, height=None,
 
     block_reward = round(sum(tx["amount"] for tx in rewards), 8)
     if rewards:
-        if counts:
-            expected = split_amounts(block_reward, counts)
-            got = {}
-            for tx in rewards:
-                if tx["to"] in got:
-                    return False, 0.0
-                got[tx["to"]] = round(tx["amount"], 8)
+        # Collect what this block actually pays.
+        got = {}
+        for tx in rewards:
+            if tx["to"] in got:
+                return False, 0.0
+            got[tx["to"]] = round(tx["amount"], 8)
+
+        def _matches(expected):
             if set(got) != set(expected):
+                return False
+            for a, amt in expected.items():
+                if abs(got[a] - amt) > 1e-7:
+                    return False
+            return True
+
+        # The old rule: the reward splits across the shares carried IN the block.
+        old_expected = split_amounts(block_reward, counts) if counts else None
+
+        # The forced fair-payout: the split dictated by the SHARE-CHAIN, which no
+        # single miner controls. Computed only when the rule is in force and we
+        # actually hold the share-chain to derive it from.
+        phase = sharechain_phase(height)
+        canon = None
+        if phase in ("grace", "hard") and share_chain is not None:
+            canon = canonical_payout(share_chain, block_reward,
+                                     window=PPLNS_WINDOW)
+
+        if phase == "hard" and canon is not None:
+            # Only the fair share-chain payout is valid. A hoarding block dies.
+            if not _matches(canon):
                 return False, 0.0
-            for addr, amt in expected.items():
-                if abs(got[addr] - amt) > 1e-7:
-                    return False, 0.0
+        elif phase == "grace" and canon is not None:
+            # Accept either the old or the fair payout, so nobody is stranded
+            # while the update spreads.
+            ok_old = (_matches(old_expected) if old_expected is not None
+                      else len(rewards) <= 1)
+            if not (_matches(canon) or ok_old):
+                return False, 0.0
         else:
-            if len(rewards) > 1:
-                return False, 0.0
+            # Rule off (or share-chain not available to us): original validation,
+            # exactly as before -- the live chain is unchanged until activation.
+            if counts:
+                if not _matches(old_expected):
+                    return False, 0.0
+            else:
+                if len(rewards) > 1:
+                    return False, 0.0
     return True, block_reward
 
 
@@ -551,7 +893,7 @@ def validate_full_chain(chain):
     return True
 
 
-def validate_new_block(chain, block):
+def validate_new_block(chain, block, share_chain=None):
     if block.previous_hash != chain.last_block.compute_hash():
         return False
     if block.index != chain.last_block.index + 1:
@@ -566,7 +908,7 @@ def validate_new_block(chain, block):
         block.transactions, block.previous_hash, share_target_for(target),
         height=block.index,
         recent_tips=_tips_before(chain.chain + [block], block.index),
-        balances_before=bb)
+        balances_before=bb, share_chain=share_chain)
     if not ok:
         return False
     if block_reward > BLOCK_REWARD + 1e-6:
@@ -624,6 +966,7 @@ class Node:
         self.chain_file = f"chain_{port}.json"
         self.wallet_file = f"wallet_{port}.pem"
         self.peers_file = f"peers_{port}.json"
+        self.peers_seen_file = f"peers_seen_{port}.json"
         self.transfers_file = f"transfers_{port}.json"
         self.validators_file = f"validators_{port}.json"
 
@@ -681,7 +1024,17 @@ class Node:
 
         self.cur_shares = {"prev": None, "by": {}, "version": 0}
         self.recent_shares = {}   # tip_hash -> {address: {nonces}} for recent tips
+        # The live share-chain: linked shares from every miner, the record the
+        # forced fair-payout is computed from. Built passively for now -- it
+        # fills in the background and nothing depends on it until the forcing
+        # rule is activated, so the chain behaves exactly as before until then.
+        self.share_chain = ShareChain()
         self.peer_misses = {}     # peer -> consecutive failed checks
+        self.peer_seen = self._load_peer_seen()   # peer url -> last answered, so
+                                  # a node that just briefly flickered still counts
+                                  # as a way in instead of vanishing -- and this
+                                  # survives a restart so the entry-point list does
+                                  # not collapse to one machine on every reboot
         # How many cores to mine with.
         #
         # Half the machine by default. Taking all-but-one pinned people's CPUs at
@@ -860,6 +1213,29 @@ class Node:
                 json.dump(sorted(self.peers), f)
         except Exception:
             pass
+        # Persist last-answered times too, so the grace window that keeps a
+        # briefly-flickering node listed as a way in survives a restart -- this
+        # is what stops the entry-point list collapsing to one machine on reboot.
+        try:
+            fresh = {u: t for u, t in self.peer_seen.items()
+                     if is_public_url(u)}
+            with open(self.peers_seen_file, "w") as f:
+                json.dump(fresh, f)
+        except Exception:
+            pass
+
+    def _load_peer_seen(self):
+        if not os.path.exists(self.peers_seen_file):
+            return {}
+        try:
+            with open(self.peers_seen_file) as f:
+                saved = json.load(f)
+            if not isinstance(saved, dict):
+                return {}
+            return {u: float(t) for u, t in saved.items()
+                    if isinstance(u, str) and is_public_url(u)}
+        except Exception:
+            return {}
 
     def _load_validators(self):
         if os.path.exists(self.validators_file):
@@ -1361,7 +1737,25 @@ def make_handler(node):
                                 "protocol": PROTOCOL_VERSION,
                                 "version": NODE_VERSION,
                                 "genesis": _CANONICAL_GENESIS_HASH})
-            elif self.path == "/network":
+            elif self.path == "/schain_tip":
+                # The share-chain's current tip, so a peer can tell whether it is
+                # behind and needs to pull the run of shares it is missing.
+                with node.lock:
+                    sc = node.share_chain
+                    tip = sc.tip
+                    self._json({
+                        "tip": tip,
+                        "height": sc.height.get(tip, 0) if tip else 0,
+                        "cum": sc.cum.get(tip, 0) if tip else 0,
+                        "count": len(sc.shares),
+                    })
+            elif self.path.startswith("/schain_shares"):
+                # Serve the recent run of share-chain shares, oldest-first, so a
+                # node that fell behind can rejoin the same share-chain. Oldest-
+                # first matters: each share's parent must arrive before it.
+                with node.lock:
+                    run = node.share_chain.tail(SHARECHAIN_KEEP)
+                self._json({"shares": run})
                 # Compact public summary for the live mint page. Small and cheap
                 # to serve no matter how long the chain gets -- the page must
                 # never have to pull the whole chain just to show activity.
@@ -1631,6 +2025,9 @@ def make_handler(node):
             elif self.path == "/share":
                 self._json({"result": handle_incoming_share(node, body)})
 
+            elif self.path == "/schain_share":
+                self._json({"result": handle_incoming_schain_share(node, body)})
+
             elif self.path == "/vote":
                 self._json({"result": handle_incoming_vote(node, body)})
 
@@ -1761,6 +2158,94 @@ def handle_incoming_share(node, s):
     return "duplicate"
 
 
+# SHARE-CHAIN integration -- stage 1: receive a linked share-chain share, prove
+# it, add it to the live share-chain, and pass it on. This runs alongside the
+# old share path and changes nothing about validation, mining or payouts yet --
+# it only builds the share-chain in the background so later stages (miners
+# producing these, then the forcing rule) have a real, agreed record to stand on.
+SHARECHAIN_KEEP = PPLNS_WINDOW + 100   # retain the payout window plus a margin
+
+
+def handle_incoming_schain_share(node, s):
+    """
+    Intake for one linked share-chain share. Accept it only if it is
+    well-formed, its id genuinely matches its own contents (real proof of
+    work), it clears the share-chain difficulty, and it links to a share we
+    already hold (or genesis). Then add it to the share-chain and relay it.
+    """
+    if not isinstance(s, dict) or not share_id_is_valid(s):
+        return "ignored"
+    # the proof must clear the current share-chain difficulty
+    try:
+        target = sharechain_target(next_target(node.chain.chain))
+    except Exception:
+        return "ignored"
+    if not share_meets_target(s, target):
+        return "invalid"
+    with node.lock:
+        known = set(node.share_chain.shares)
+        if not share_link_ok(s, known):
+            # a share whose parent we don't have yet -- can't place it in the
+            # chain (its work isn't lost; a resync will pick up the run in order)
+            return "orphan"
+        added = node.share_chain.add(s)
+        if added:
+            node.share_chain.prune(SHARECHAIN_KEEP)
+    if added:
+        gossip(node, "/schain_share", s)
+        return "accepted"
+    return "duplicate"
+
+
+def mine_one_schain_share(node, address, max_tries=200000):
+    """
+    Produce ONE linked share-chain share: find a nonce whose share hashes under
+    the share-chain target, building on the current tip and anchored to the
+    current block. Adds it locally and relays it. Returns the share, or None if
+    no nonce cleared the target within max_tries (the caller just tries again
+    next pass). This is what actually fills the share-chain as a miner works.
+    """
+    with node.lock:
+        tip = node.share_chain.tip or SHARECHAIN_GENESIS
+        block_prev = node.chain.last_block.compute_hash()
+    try:
+        target = sharechain_target(next_target(node.chain.chain))
+    except Exception:
+        return None
+    nonce = random.randrange(1 << 62)
+    for _ in range(max_tries):
+        sid = sharechain_share_id(tip, block_prev, address, nonce)
+        if int(sid, 16) < target:
+            share = {"share_prev": tip, "block_prev": block_prev,
+                     "address": address, "nonce": nonce, "id": sid}
+            handle_incoming_schain_share(node, share)
+            return share
+        nonce += 1
+    return None
+
+
+def pull_schain(node):
+    """
+    Catch up the share-chain from peers. Ask each peer for its recent shares
+    and feed them through the normal intake (which proves + links each one), so
+    a node that fell behind rejoins the same share-chain everyone else is on.
+    """
+    added = 0
+    for peer in list(node.peers)[:6]:
+        data = get_json(peer.rstrip("/") + "/schain_shares", timeout=4)
+        if not isinstance(data, dict):
+            continue
+        shares = data.get("shares")
+        if not isinstance(shares, list):
+            continue
+        # oldest-first so each share's parent is present before its child
+        for s in shares:
+            res = handle_incoming_schain_share(node, s)
+            if res == "accepted":
+                added += 1
+    return added
+
+
 def handle_incoming_block(node, block):
     accepted = False
     need_sync = False
@@ -1768,7 +2253,7 @@ def handle_incoming_block(node, block):
         last = node.chain.last_block
         if block.index <= last.index:
             pass
-        elif block.index == last.index + 1 and validate_new_block(node.chain, block):
+        elif block.index == last.index + 1 and validate_new_block(node.chain, block, share_chain=node.share_chain):
             node.chain.chain.append(block)
             node.save_chain()
             node._ensure_share_height()
@@ -2015,6 +2500,7 @@ def sync_chain(node):
     for p in peers:
         if p in good:
             node.peer_misses.pop(p, None)
+            node.peer_seen[p] = time.time()      # remember it was alive just now
         else:
             node.peer_misses[p] = node.peer_misses.get(p, 0) + 1
             if node.peer_misses[p] >= 5 and p not in HARDCODED_SEEDS:
@@ -2205,6 +2691,10 @@ def sync(node):
         pull_shares(node)
     except Exception:
         pass
+    try:
+        pull_schain(node)     # keep our share-chain caught up with the network
+    except Exception:
+        pass
     sync_transfers(node)
     revote_pending(node)
     push_chain(node)          # shove our blocks OUT so unreachable miners still count
@@ -2321,23 +2811,40 @@ def is_public_url(url):
     return True
 
 
+# A peer that answered within this many seconds still counts as a way in, even
+# if it doesn't answer the very instant we re-check. Home nodes flicker (a VPN
+# hiccup, a brief drop); dropping them from the entry-point list the moment they
+# blink made a healthy multi-node network look like it had collapsed back to one
+# machine. The grace window shows the network as it actually is over the last few
+# minutes, not just this exact second.
+PEER_GRACE_SECONDS = 300
+
+
 def good_seeds(node, verify=False, limit=20):
     """
     The entry points this node would recommend to a newcomer: public addresses,
-    running our coin, that were actually answering recently.
+    running our coin, that were reachable recently -- not only ones answering
+    this exact instant, so a node mid-flicker still counts as a way in.
     """
+    now = time.time()
     with node.lock:
         candidates = [p for p in node.peers if is_public_url(p)]
         if node.reachable and node.public_url and is_public_url(node.public_url):
             candidates.append(node.public_url)
+        seen_map = dict(node.peer_seen)
     seen, out = set(), []
     for url in candidates:
         u = url.rstrip("/")
         if u in seen:
             continue
         seen.add(u)
-        if verify and not _answers(u, timeout=3):
-            continue
+        if verify:
+            if (now - seen_map.get(u, 0)) <= PEER_GRACE_SECONDS:
+                pass                              # answered recently -- keep it
+            elif _answers(u, timeout=3):
+                node.peer_seen[u] = now           # answers now -- refresh + keep
+            else:
+                continue                          # not recent and silent -- drop
         out.append(u)
         if len(out) >= limit:
             break
@@ -2818,7 +3325,18 @@ def _mine_one_block_racing(node):
         if share_list:
             txs.append({"type": "shares", "list": share_list})
         if reward > 0:
-            if counts:
+            # When the forcing rule is in force, the payout is the share-chain's
+            # canonical split -- the same one every validator will check against.
+            # Below activation, the original in-block split is used and nothing
+            # changes. During grace either is accepted; we build the fair one.
+            phase = sharechain_phase(prev.index + 1)
+            canon = None
+            if phase in ("grace", "hard"):
+                canon = canonical_payout(node.share_chain, reward,
+                                         window=PPLNS_WINDOW)
+            if canon:
+                txs += [make_reward(a, amt) for a, amt in sorted(canon.items())]
+            elif counts:
                 txs += [make_reward(a, amt)
                         for a, amt in sorted(split_amounts(reward, counts).items())]
             else:
@@ -2893,6 +3411,12 @@ def _mine_one_block_racing(node):
     box_lock = threading.Lock()
     counter = {"hashes": 0}
     gen = {"n": 0, "txs": candidate.transactions}
+    # Share-chain production rides the SAME hashing crew: one extra hash per
+    # attempt, reusing the nonce, instead of a whole second mining loop. `sc_tip`
+    # is refreshed as our shares land so each new one chains onto the latest.
+    sc_target = sharechain_target(target)
+    sc = {"tip": (node.share_chain.tip or SHARECHAIN_GENESIS)}
+    schain_box = []
 
     def worker(slot):
         my_gen = -1
@@ -2909,6 +3433,15 @@ def _mine_one_block_racing(node):
             if int(share_hash(prev_hash, my_addr, sn), 16) < s_target:
                 with box_lock:
                     share_box.append(sn)
+            # a share-chain attempt -- one extra hash, reusing this same nonce,
+            # so the share-chain fills at the natural rate with no second loop
+            sc_id = sharechain_share_id(sc["tip"], prev_hash, my_addr, sn)
+            if int(sc_id, 16) < sc_target:
+                with box_lock:
+                    schain_box.append({"share_prev": sc["tip"],
+                                       "block_prev": prev_hash,
+                                       "address": my_addr, "nonce": sn,
+                                       "id": sc_id})
             # a block attempt -- every worker walks a different lane of nonces
             blk.nonce = nb
             if int(blk.pow_hash(), 16) < target:
@@ -2919,7 +3452,7 @@ def _mine_one_block_racing(node):
                 return
             nb += n_workers
             with box_lock:
-                counter["hashes"] += 2
+                counter["hashes"] += 3
 
     crew = [threading.Thread(target=worker, args=(i,), daemon=True)
             for i in range(n_workers)]
@@ -2980,6 +3513,21 @@ def _mine_one_block_racing(node):
         for n0 in fresh_shares:
             gossip(node, "/share",
                    {"prev_hash": prev_hash, "address": my_addr, "nonce": n0})
+        # Drain the share-chain shares the crew turned up (one hash each, no
+        # separate mining loop) -- add and relay them, then advance our tip so
+        # the next ones chain onto the newest. Dormant-safe: this only builds
+        # the record; nothing depends on it until the forcing rule activates.
+        with box_lock:
+            fresh_sc = schain_box[:]
+            schain_box.clear()
+        for sh in fresh_sc:
+            try:
+                handle_incoming_schain_share(node, sh)
+            except Exception:
+                pass
+        if fresh_sc:
+            with node.lock:
+                sc["tip"] = node.share_chain.tip or SHARECHAIN_GENESIS
         fresh_shares = []
 
         found = found_block is not None
