@@ -127,7 +127,7 @@ ACTIVE_VALIDATOR_WINDOW = 15 * 60
 # window, faster syncing, bug fixes that only tighten what was already invalid.
 # Nobody has to agree on it and nothing can split over it.
 PROTOCOL_VERSION = 4
-NODE_VERSION = "2.15.1"
+NODE_VERSION = "2.15.2"
 
 # Blocks may carry a small tag naming the build that made them. It is accepted
 # and recorded, never required. A rule that forces everyone onto a particular
@@ -578,7 +578,7 @@ def canonical_payout(share_chain, reward, window=PPLNS_WINDOW, tip=None):
 # only after real-node testing). While it is None the rule is off everywhere and
 # the live chain validates exactly as it does today -- the same safe pattern the
 # 4500 transfer switch used.
-SHARECHAIN_ACTIVATION_HEIGHT = None
+SHARECHAIN_ACTIVATION_HEIGHT = 5400
 
 # After activation, this many blocks accept EITHER the old in-block split OR the
 # new share-chain payout -- so no active miner is stranded the instant the rule
@@ -2229,6 +2229,24 @@ SHARECHAIN_KEEP = PPLNS_WINDOW + 100   # retain the payout window plus a margin
 SCHAIN_PENDING_MAX = 500   # shares parked awaiting a parent, across all parents
 
 
+def _schain_target_at(node, block_prev):
+    """
+    The share-chain target as of the block a share is anchored to. Deriving it
+    from the anchor block -- not the validator's current tip -- means every node
+    computes the SAME target for a given share no matter when it arrives. That
+    is what stops a share being accepted by its maker yet rejected by a seed a
+    few blocks later, which was silently dropping nearly every share in transit.
+    Only recent anchors are searched (shares anchor to the current tip), so this
+    stays cheap on a long chain.
+    """
+    chain = node.chain.chain
+    lo = max(0, len(chain) - 40)
+    for i in range(len(chain) - 1, lo - 1, -1):
+        if chain[i].compute_hash() == block_prev:
+            return sharechain_target(next_target(chain[:i + 1]))
+    return None
+
+
 def handle_incoming_schain_share(node, s):
     """
     Intake for one linked share-chain share. Proof and structure are checked,
@@ -2240,9 +2258,13 @@ def handle_incoming_schain_share(node, s):
     """
     if not isinstance(s, dict) or not share_id_is_valid(s):
         return "ignored"
-    # the proof must clear the current share-chain difficulty
+    # the proof must clear the difficulty AS OF THE SHARE'S ANCHOR BLOCK, so
+    # every node agrees on it regardless of how far its own tip has moved
     try:
-        target = sharechain_target(next_target(node.chain.chain))
+        target = _schain_target_at(node, s.get("block_prev"))
+        if target is None:
+            # anchor not in our recent chain -- fall back to current difficulty
+            target = sharechain_target(next_target(node.chain.chain))
     except Exception:
         return "ignored"
     if not share_meets_target(s, target):
