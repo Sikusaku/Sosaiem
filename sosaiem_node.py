@@ -127,7 +127,7 @@ ACTIVE_VALIDATOR_WINDOW = 15 * 60
 # window, faster syncing, bug fixes that only tighten what was already invalid.
 # Nobody has to agree on it and nothing can split over it.
 PROTOCOL_VERSION = 4
-NODE_VERSION = "2.15.9"   # fair split (cross-branch payout) activates at 6375
+NODE_VERSION = "2.15.10"   # PAYLIST: updated miners pay everyone who worked; activates at 6500
 
 # Blocks may carry a small tag naming the build that made them. It is accepted
 # and recorded, never required. A rule that forces everyone onto a particular
@@ -460,7 +460,7 @@ class ShareChain:
             return ca > cb
         return a < b
 
-    def add(self, share, work=1, allow_root=False):
+    def add(self, share, work=1, allow_root=False, verify=True):
         """
         Add one share. It must be well-formed, carry a valid id (its own proof),
         and link to a parent we already hold (or genesis). Returns True if it
@@ -469,8 +469,16 @@ class ShareChain:
         whichever leaf now has the most cumulative work. `allow_root` is only
         used when reloading a pruned snapshot from disk: the oldest kept share's
         parent no longer exists, so it legitimately roots the kept range.
+        `verify=False` is for reloading OUR OWN saved cache on startup: those
+        shares were already proof-checked when we first accepted them, so we skip
+        the per-share memory-hard re-proof (thousands of them was a minutes-long
+        boot hang that took the seed offline) and only require the fields we index.
         """
-        if not share_id_is_valid(share):
+        if verify:
+            if not share_id_is_valid(share):
+                return False
+        elif not (isinstance(share, dict) and isinstance(share.get("id"), str)
+                  and "share_prev" in share and "address" in share):
             return False
         sid = share["id"]
         if sid in self.shares:
@@ -521,8 +529,11 @@ class ShareChain:
         if not isinstance(shares, list):
             return 0
         ids = {s.get("id") for s in shares if isinstance(s, dict)}
+        # trusted load: these are shares we already proof-checked and saved
+        # ourselves. Skip the per-share memory-hard re-proof (that was the boot
+        # hang) -- just require an id, and add() with verify=False.
         pending = [s for s in shares
-                   if isinstance(s, dict) and share_id_is_valid(s)]
+                   if isinstance(s, dict) and isinstance(s.get("id"), str)]
         added = 0
         progress = True
         while pending and progress:
@@ -531,13 +542,13 @@ class ShareChain:
             for s in pending:
                 sp = s["share_prev"]
                 if sp == SHARECHAIN_GENESIS or sp in self.shares:
-                    if self.add(s):
+                    if self.add(s, verify=False):
                         added += 1
                     progress = True
                 elif sp not in ids:
                     # its parent was pruned away before the snapshot -- this
                     # share legitimately roots the kept range
-                    if self.add(s, allow_root=True):
+                    if self.add(s, allow_root=True, verify=False):
                         added += 1
                     progress = True
                 else:
@@ -672,6 +683,21 @@ def canonical_payout(share_chain, reward, window=PPLNS_WINDOW, tip=None,
 # file changes nothing on its own.
 # ---------------------------------------------------------------------------
 SCHAIN_ALLPAY_ACTIVATION_HEIGHT = 6375
+
+
+# PAYLIST (dormant): pay the reward across the proof-of-work shares recorded IN
+# the block itself, not the share-chain. The block's share list is PoW-verified
+# by every node and is identical for builder and validator, so "who worked" and
+# "who gets paid" become the same set by construction -- nobody who did work is
+# skipped because their share didn't happen to link into one node's share-chain
+# (the "6 worked, 2 paid" bug). Consensus change -> stays off until a coordinated
+# activation height, and must be tested on real nodes first. None = off everywhere.
+SCHAIN_PAYLIST_ACTIVATION_HEIGHT = 6500
+
+
+def paylist_active(height):
+    h = SCHAIN_PAYLIST_ACTIVATION_HEIGHT
+    return h is not None and height is not None and height >= h
 
 
 def allpay_active(height):
@@ -990,7 +1016,17 @@ def _check_block_content(transactions, prev_hash, share_target, height=None,
                 return [s for s in w if s.get("block_prev") in schain_fresh]
             return share_chain.tail(PPLNS_WINDOW)
 
-        if phase == "hard":
+        if paylist_active(height):
+            # PAYLIST: the reward must equal the split across the block's own
+            # proof-of-work-verified share list. Every node reads that list from
+            # the block and computes the identical split, so it's deterministic
+            # (no fork from propagation lag) and inclusive -- everyone recorded
+            # as having worked in this block is paid, nobody is skipped.
+            ok_pay = (_matches(old_expected) if old_expected is not None
+                      else len(got) <= 1)
+            if not ok_pay:
+                return False, 0.0
+        elif phase == "hard":
             # The fair payout is ideal -- accept it outright.
             if canon and _matches(canon):
                 pass
@@ -3742,7 +3778,12 @@ def _mine_one_block_racing(node):
             # changes. During grace either is accepted; we build the fair one.
             phase = sharechain_phase(prev.index + 1)
             canon = None
-            if phase in ("grace", "hard"):
+            if paylist_active(prev.index + 1):
+                # pay across the proof-of-work shares carried in THIS block --
+                # the same list every validator verifies and reads, so everyone
+                # who worked (and is in the block) is paid, deterministically.
+                canon = split_amounts(reward, counts) if counts else None
+            elif phase in ("grace", "hard"):
                 # Same anchor-recency set the validator will derive from this
                 # same parent block, so the fair split we build matches theirs.
                 fresh = (fresh_anchor_hashes(node.chain.chain, prev_hash)

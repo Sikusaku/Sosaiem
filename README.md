@@ -4,7 +4,7 @@ Sosaiem is a community proof-of-work cryptocurrency. No company, no pre-mine —
 coins only come into existence by mining. The reference node, miner, and wallet
 are all in this repository.
 
-**Current version:** 2.15.9 · protocol 4
+**Current version:** 2.15.10 · protocol 4
 **Website / downloads:** https://sosaiem.com
 
 ## Network parameters
@@ -86,6 +86,12 @@ Windows users can download prebuilt apps from https://sosaiem.com, or run
 `build_exe.bat` to package the `.exe`s themselves.
 
 ## Changelog
+
+- **2.15.10** — Pay-the-block's-shares: every block reward is split across the
+  proof-of-work shares recorded IN that block, which every node verifies and
+  reads identically. This makes an updated miner's blocks pay *everyone* who did
+  work in them (fixing "several miners worked, one got paid") with no dependence
+  on share propagation. Activates at block **6500**. Includes the startup-hang fix.
 
 - **2.15.9** — Fair split: every block reward is split across all miners who did
   recent work, in proportion, instead of one miner taking the whole block.
