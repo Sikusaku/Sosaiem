@@ -4,7 +4,7 @@ Sosaiem is a community proof-of-work cryptocurrency. No company, no pre-mine —
 coins only come into existence by mining. The reference node, miner, and wallet
 are all in this repository.
 
-**Current version:** 2.15.8 · protocol 4
+**Current version:** 2.15.9 · protocol 4
 **Website / downloads:** https://sosaiem.com
 
 ## Network parameters
@@ -37,7 +37,8 @@ Consensus rule changes are gated to a block height so every node switches
 together instead of forking:
 
 - **5400** — fair-payout enforcement (forcing rule) turned on.
-- **6200** — anchor-recency rule turns on: a share only counts toward a payout
+- **6375** — fair-split turns on: every block is split across *all* miners who did recent work, in proportion, instead of one miner taking the whole block. (The earlier anchor-recency rule is off in this build.)
+- ~~6200 — anchor-recency~~ (superseded): a share only counts toward a payout
   if it was mined against a recent block (within the last 30). This stops a
   dormant branch of old shares from capturing the payout window and starving the
   miners actually working. Below this height the payout is computed exactly as
@@ -86,7 +87,9 @@ Windows users can download prebuilt apps from https://sosaiem.com, or run
 
 ## Changelog
 
-- **2.15.8** — Anchor-recency payout fix: shares must be anchored to a recent
-  block to count toward a payout, so stale/dormant shares can no longer capture
-  the reward window and freeze out current miners. Activates at block 6200.
+- **2.15.9** — Fair split: every block reward is split across all miners who did
+  recent work, in proportion, instead of one miner taking the whole block.
+  Activates at block **6375**. Also fixes a startup hang (share-cache was being
+  re-verified on every boot) and a broken share-exchange endpoint between nodes.
+- **2.15.8** — Anchor-recency payout groundwork.
 - **2.15.6** — Prior release.

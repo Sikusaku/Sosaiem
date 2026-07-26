@@ -127,7 +127,7 @@ ACTIVE_VALIDATOR_WINDOW = 15 * 60
 # window, faster syncing, bug fixes that only tighten what was already invalid.
 # Nobody has to agree on it and nothing can split over it.
 PROTOCOL_VERSION = 4
-NODE_VERSION = "2.15.8"   # anchor-recency payout fix, activates at height 6200
+NODE_VERSION = "2.15.9"   # fair split (cross-branch payout) activates at 6375
 
 # Blocks may carry a small tag naming the build that made them. It is accepted
 # and recorded, never required. A rule that forces everyone onto a particular
@@ -658,6 +658,49 @@ def canonical_payout(share_chain, reward, window=PPLNS_WINDOW, tip=None,
     return split_amounts(reward, counts)
 
 
+# ---------------------------------------------------------------------------
+# CROSS-BRANCH FAIR PAYOUT  (dormant -- activation height is None)
+#
+# The linear payout above walks a single line back from the tip, so when two
+# miners mine at the same instant they build PARALLEL branches and only the
+# branch the tip lands on gets paid -- one miner takes the whole block. That is
+# the "no share split / 1 miner per block" bug. This counts EVERY recent valid
+# share across ALL branches instead, so concurrent work is paid in proportion.
+#
+# It is a consensus change, so it stays OFF (activation None) and must NOT be
+# switched on until it is verified on a real multi-node network. Deploying this
+# file changes nothing on its own.
+# ---------------------------------------------------------------------------
+SCHAIN_ALLPAY_ACTIVATION_HEIGHT = 6375
+
+
+def allpay_active(height):
+    h = SCHAIN_ALLPAY_ACTIVATION_HEIGHT
+    return h is not None and height is not None and height >= h
+
+
+def canonical_payout_allwork(share_chain, reward, window=PPLNS_WINDOW, fresh=None):
+    """Fair split counting every recent valid share across all branches, not
+    just the tip's line. Deterministic: all nodes hold the same converged shares
+    and heights, so all compute the same split."""
+    tip = (share_chain.best_recent_tip(fresh) if fresh is not None
+           else share_chain.tip)
+    if tip is None:
+        return {}
+    top = share_chain.height.get(tip, 0)
+    lo = top - window
+    counts = {}
+    for sid, s in share_chain.shares.items():
+        h = share_chain.height.get(sid)
+        if h is None or h <= lo or h > top:
+            continue
+        if fresh is not None and s.get("block_prev") not in fresh:
+            continue
+        a = s["address"]
+        counts[a] = counts.get(a, 0) + 1
+    return split_amounts(reward, counts)
+
+
 # SHARE-CHAIN -- step 5: the forcing rule, and its activation switch.
 #
 # When active, a block's reward transactions MUST equal the canonical payout
@@ -705,7 +748,7 @@ def sharechain_phase(height):
 # nodes still on the old build instead of splitting from them, and the rule then
 # turns on cleanly at 6200 once the whole network is updated. While off, `fresh`
 # is never passed and the payout is computed exactly as it is today.
-SCHAIN_ANCHOR_ACTIVATION_HEIGHT = 6200
+SCHAIN_ANCHOR_ACTIVATION_HEIGHT = None
 
 
 def anchor_rule_active(height):
@@ -927,8 +970,11 @@ def _check_block_content(transactions, prev_hash, share_target, height=None,
         phase = sharechain_phase(height)
         canon = None
         if phase in ("grace", "hard") and share_chain is not None:
-            canon = canonical_payout(share_chain, block_reward,
-                                     window=PPLNS_WINDOW, fresh=schain_fresh)
+            canon = (canonical_payout_allwork(share_chain, block_reward,
+                                              window=PPLNS_WINDOW, fresh=schain_fresh)
+                     if allpay_active(height)
+                     else canonical_payout(share_chain, block_reward,
+                                           window=PPLNS_WINDOW, fresh=schain_fresh))
 
         def _recent_window():
             # the payout window the anti-freeze check reasons over. Once the
@@ -2014,6 +2060,8 @@ def make_handler(node):
                 with node.lock:
                     run = node.share_chain.tail(SHARECHAIN_KEEP)
                 self._json({"shares": run})
+                return                       # BUGFIX: was falling through into a
+                                             # second response, breaking share pull
                 # Compact public summary for the live mint page. Small and cheap
                 # to serve no matter how long the chain gets -- the page must
                 # never have to pull the whole chain just to show activity.
@@ -3699,8 +3747,11 @@ def _mine_one_block_racing(node):
                 # same parent block, so the fair split we build matches theirs.
                 fresh = (fresh_anchor_hashes(node.chain.chain, prev_hash)
                          if anchor_rule_active(prev.index + 1) else None)
-                canon = canonical_payout(node.share_chain, reward,
-                                         window=PPLNS_WINDOW, fresh=fresh)
+                canon = (canonical_payout_allwork(node.share_chain, reward,
+                                                  window=PPLNS_WINDOW, fresh=fresh)
+                         if allpay_active(prev.index + 1)
+                         else canonical_payout(node.share_chain, reward,
+                                               window=PPLNS_WINDOW, fresh=fresh))
             if canon:
                 txs += [make_reward(a, amt) for a, amt in sorted(canon.items())]
             elif counts:
