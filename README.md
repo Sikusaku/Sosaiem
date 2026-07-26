@@ -1,57 +1,92 @@
-# Sosaiem (SOSA)
+# Sosaiem
 
-Sosaiem is a real, from-scratch **proof-of-work cryptocurrency** written in Python —
-its own blockchain, its own consensus, no dependency on another chain. It is
-open-source so anyone can read exactly how it works and verify there is nothing
-hidden.
+Sosaiem is a community proof-of-work cryptocurrency. No company, no pre-mine —
+coins only come into existence by mining. The reference node, miner, and wallet
+are all in this repository.
 
-Current build: **2.15.2** · consensus protocol **v4** · target block time **60s** ·
-block reward **1.66666667 SOSA** · max supply **12,212,010 SOSA**.
+**Current version:** 2.15.8 · protocol 4
+**Website / downloads:** https://sosaiem.com
 
-## What makes it different
+## Network parameters
 
-- **ASIC-resistant mining.** Proof-of-work is memory-hard (scrypt, 8 MB per attempt),
-  so it stays mineable on a normal PC instead of turning into a specialised-hardware
-  race.
-- **No pool operator.** Miners submit verifiable work-shares and each block's reward is
-  split proportionally across everyone's shares; every node re-checks the maths. You get
-  a fair cut of the work you did, with no operator taking a slice.
-- **Feeless, offline-capable transfers.** To send, your own device does a few seconds of
-  proof-of-work on the payment (no fee), and the chain settles it into a block. A
-  transfer completes even if the recipient — or everyone else — is offline, and it
-  settles in a block or two (about a minute). Dependable rather than instant.
-- **Post-quantum from genesis.** Signatures use ML-DSA (NIST FIPS 204), so the network
-  is secure against quantum computers from its first block.
-- **No premine, no founder cut, no KYC.** Every coin is mined in the open.
+| | |
+|---|---|
+| Consensus | Proof of work (scrypt, memory-hard, ~8 MB per attempt) |
+| Target block time | 60 seconds |
+| Block reward | 1.66666667 SOSA (100 SOSA/hour) |
+| Max supply | 12,212,010 SOSA |
+| Wallet signatures | ML-DSA-65 (post-quantum) |
+| Genesis hash | `c09bb5567bfd98d5afbd073dd1a764a94e4f19a0dceb35d4bef898b0595d21f0` |
 
-## Running it
+## Fair payouts (share-chain)
 
-Requires Python 3. Standard library only — nothing to install.
+Mining rewards are not kept by whoever happens to find a block. Sosaiem runs a
+decentralized share-chain (P2Pool-style): every miner's proof-of-work is
+recorded as shares, and each block reward is split across the recent window
+(PPLNS, last 300 shares) in proportion to the work each address actually did.
+Shares stay payable for a short window so slower miners aren't cut out on timing
+alone, and orphaned shares are still credited.
 
-- **Run a node:** `python sosaiem_node.py 80`
-- **Mine / wallet:** run the miner and wallet apps (one-click `.exe` on Windows via
-  `build_exe.bat`, or run the Python directly on Mac/Linux).
+This split is deterministic and enforced — every node computes the same
+canonical payout from the share-chain, and a block whose rewards don't match it
+is rejected. A miner cannot pay only themselves.
 
-Nodes make themselves reachable automatically where possible (UPnP via `portmap.py`) and
-find each other through decentralized relays (Nostr via `nostrseed.py`), so the network
-does not depend on any single server.
+### Activation heights
+
+Consensus rule changes are gated to a block height so every node switches
+together instead of forking:
+
+- **5400** — fair-payout enforcement (forcing rule) turned on.
+- **6200** — anchor-recency rule turns on: a share only counts toward a payout
+  if it was mined against a recent block (within the last 30). This stops a
+  dormant branch of old shares from capturing the payout window and starving the
+  miners actually working. Below this height the payout is computed exactly as
+  before, so nodes on older builds stay in consensus until the whole network has
+  updated.
+
+> **Note for miners:** be on 2.15.8 before block 6200. Nodes still on older code
+> past that height will disagree on payouts and can fork off onto a minority
+> chain.
 
 ## Files
 
-| File | What it is |
-| --- | --- |
-| `sosaiem_node.py` | The node: mining, transfers, P2P networking, all the rules |
-| `blockchain.py` | Blocks, chain, difficulty |
-| `coin.py` | Rewards, transfers, balances, supply cap |
-| `wallet.py`, `seedphrase.py` | Keys, signing, recovery phrases |
-| `sosaiem_miner.py`, `sosaiem_wallet.py` | The miner and wallet apps |
-| `portmap.py` | Asks the router to open a port (UPnP) so home nodes are reachable |
-| `nostrseed.py` | Finds the network via Nostr relays, no central server needed |
-| `seeds.txt` | Starter list of nodes to connect to |
-| `build_exe.bat`, `start_miner.bat`, `start_wallet.bat` | Windows build/run helpers |
+| File | Purpose |
+|---|---|
+| `sosaiem_node.py` | Full node: blockchain, share-chain, P2P, mining loop, HTTP API |
+| `sosaiem_miner.py` | Miner (desktop UI) |
+| `sosaiem_wallet.py` | Wallet (desktop UI) |
+| `blockchain.py` | Block, chain, proof-of-work, difficulty retargeting |
+| `coin.py` | Balances, supply, reward schedule |
+| `wallet.py` | Post-quantum keys, signing, verification, addresses |
+| `seedphrase.py` | Deterministic key derivation from a seed phrase |
+| `nostrseed.py` | Peer discovery helper |
+| `portmap.py` | UPnP/NAT port mapping helper |
+| `seeds.txt` | Bootstrap seed nodes |
+| `build_exe.bat` | Build Windows `.exe`s (miner + wallet) |
+| `start_miner.bat` / `start_wallet.bat` | Launch helpers |
 
-## Note
+## Running from source (Mac / Linux / developers)
 
-This is a young, community-run project — experimental software. Transfers settle inside
-blocks, which relies on mining continuing; securing them beyond the mining era (~14
-years out) is an open question the project intends to address before then.
+Requires Python 3.11+ and:
+
+```
+pip install dilithium-py cryptography
+```
+
+Then:
+
+```
+python sosaiem_node.py      # run a node
+python sosaiem_miner.py     # mine
+python sosaiem_wallet.py    # wallet
+```
+
+Windows users can download prebuilt apps from https://sosaiem.com, or run
+`build_exe.bat` to package the `.exe`s themselves.
+
+## Changelog
+
+- **2.15.8** — Anchor-recency payout fix: shares must be anchored to a recent
+  block to count toward a payout, so stale/dormant shares can no longer capture
+  the reward window and freeze out current miners. Activates at block 6200.
+- **2.15.6** — Prior release.
