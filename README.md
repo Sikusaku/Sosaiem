@@ -4,7 +4,7 @@ Sosaiem is a community proof-of-work cryptocurrency. No company, no pre-mine —
 coins only come into existence by mining. The reference node, miner, and wallet
 are all in this repository.
 
-**Current version:** 2.15.10 · protocol 4
+**Current version:** 2.15.11 · protocol 4
 **Website / downloads:** https://sosaiem.com
 
 ## Network parameters
@@ -86,6 +86,16 @@ Windows users can download prebuilt apps from https://sosaiem.com, or run
 `build_exe.bat` to package the `.exe`s themselves.
 
 ## Changelog
+
+- **2.15.11** — All-time transfer history in the block explorer: look up any SOSA
+  address to see its complete send/receive history (not just the latest few), and
+  the Transfers view now pages through the entire ledger. Also fixes a mining node
+  that could fall behind and stall on its own minority fork: a miner now detects
+  when the network hasn't shown it anyone ahead for a few minutes and rejoins the
+  real tip on its own, instead of needing a restart. Networking/explorer only — no
+  consensus change, no activation height. Transfer history is per-node (a node
+  shows transfers it has confirmed while online); mining history remains fully
+  on-chain.
 
 - **2.15.10** — Pay-the-block's-shares: every block reward is split across the
   proof-of-work shares recorded IN that block, which every node verifies and

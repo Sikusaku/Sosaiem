@@ -127,7 +127,7 @@ ACTIVE_VALIDATOR_WINDOW = 15 * 60
 # window, faster syncing, bug fixes that only tighten what was already invalid.
 # Nobody has to agree on it and nothing can split over it.
 PROTOCOL_VERSION = 4
-NODE_VERSION = "2.15.10"   # PAYLIST: updated miners pay everyone who worked; activates at 6500
+NODE_VERSION = "2.15.11"   # + all-time transfer history in explorer; miner self-heal when left behind
 
 # Blocks may carry a small tag naming the build that made them. It is accepted
 # and recorded, never required. A rule that forces everyone onto a particular
@@ -2186,16 +2186,32 @@ def make_handler(node):
             elif self.path.startswith("/transfers"):
                 # Transfers never enter a block: they are agreed by stake-weighted
                 # vote. Without this the whole payment side of the ledger would be
-                # invisible to anyone browsing.
+                # invisible to anyone browsing. Now paginated so the explorer can
+                # walk the ENTIRE ledger (?limit=&offset=), not just the newest.
                 q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 sig_want = (q.get("sig", [""])[0] or "").strip()
+                try:
+                    limit = int(q.get("limit", ["40"])[0])
+                except ValueError:
+                    limit = 40
+                try:
+                    offset = int(q.get("offset", ["0"])[0])
+                except ValueError:
+                    offset = 0
+                if limit <= 0:
+                    limit = 40
                 with node.lock:
                     balances = node.get_balances()
+                    total = len(node.confirmed_log)
                     out = []
-                    for entry in reversed(node.confirmed_log[-200:]):
+                    seen = 0
+                    for entry in reversed(node.confirmed_log):
                         tx = entry.get("tx", {})
                         sig = tx.get("signature", "")
                         if sig_want and not sig.startswith(sig_want):
+                            continue
+                        if not sig_want and seen < offset:
+                            seen += 1
                             continue
                         votes = entry.get("votes", {})
                         yes = sum(max(balances.get(a, 0), 0.0)
@@ -2212,13 +2228,14 @@ def make_handler(node):
                                        "weight": round(max(balances.get(a, 0), 0.0), 8)}
                                       for a, v in sorted(votes.items())],
                         })
-                        if len(out) >= (1 if sig_want else 40):
+                        if len(out) >= (1 if sig_want else limit):
                             break
                     pending = [{"from": t.get("from"), "to": t.get("to"),
                                 "amount": t.get("amount"), "signature": s}
                                for s, t in node.transfers.items()
                                if s not in node.confirmed][:20]
-                self._json({"confirmed": out, "pending": pending})
+                self._json({"confirmed": out, "pending": pending,
+                            "total": total, "offset": offset, "limit": limit})
 
             elif self.path.startswith("/shares"):
                 # Shares only ever travelled by push before, which quietly broke
@@ -2282,21 +2299,34 @@ def make_handler(node):
                             first = b.index if first is None else first
                             last = b.index
                     moves = []
-                    for entry in node.confirmed_log[-400:]:
+                    for entry in node.confirmed_log:          # full log, not [-400:]
                         tx = entry.get("tx", {})
                         if tx.get("from") == a or tx.get("to") == a:
                             moves.append({"dir": "out" if tx.get("from") == a else "in",
                                           "amount": tx.get("amount"),
                                           "other": tx.get("to") if tx.get("from") == a
                                                    else tx.get("from"),
-                                          "t": tx.get("timestamp")})
+                                          "t": tx.get("timestamp"),
+                                          "sig": tx.get("signature")})
+                    moves.reverse()                           # newest first
+                    total_moves = len(moves)
+                    try:
+                        limit = int(q.get("limit", ["0"])[0])
+                        offset = int(q.get("offset", ["0"])[0])
+                    except ValueError:
+                        limit, offset = 0, 0
+                    if offset > 0:
+                        moves = moves[offset:]
+                    if limit > 0:
+                        moves = moves[:limit]
                     self._json({
                         "address": a,
                         "balance": round(node.get_balances().get(a, 0.0), 8),
                         "mined": round(mined, 8),
                         "blocks_paid": blocks_paid,
                         "first_block": first, "last_block": last,
-                        "transfers": moves[-25:][::-1],
+                        "transfers": moves,
+                        "transfers_total": total_moves,
                     })
             else:
                 self._json({"error": "unknown"}, 404)
@@ -2957,6 +2987,12 @@ def sync_chain(node):
         return
     ahead.sort(reverse=True)
 
+    # Being strictly behind a live peer proves we are in touch with a moving,
+    # real tip -- remember it. This, not our own mined height, is what tells an
+    # actively-mining node it is on the network and not on a private island.
+    if ahead and ahead[0][0] > mine:
+        node._last_peer_adopt = time.time()
+
     best, source = node.chain, None
     for _, peer in ahead[:3]:
         # The whole chain is a bulk download and it grows: 267 blocks was ~680 KB,
@@ -2987,6 +3023,7 @@ def sync_chain(node):
             node.chain = best
             node.save_chain()
             node._ensure_share_height()
+            node._last_peer_adopt = time.time()
             switched = True
     if switched:
         print(f"\n  [sync] adopted a better chain from {source} "
@@ -3529,33 +3566,54 @@ def retry_bootstrap(node):
     """
     Keep looking for a way in, so a node that started while every entry point
     was down still joins later without anyone restarting it.
+
+    Two ways to notice we are cut off:
+      1. Plain isolation -- our chain height has not moved for a few minutes.
+      2. Miner isolation -- height IS moving, but only because WE are mining it.
+         A miner that has fallen onto a private/minority fork keeps extending
+         its own chain for ever, so check (1) never fires (its height keeps
+         climbing). The real tell is that the network has not shown us anyone
+         ahead in a long time: a node truly on the network loses the occasional
+         block race and adopts the winner's chain; an islanded miner never
+         does, because it is the biggest fish in a tiny pond. When that happens,
+         go back to the seed list to find a node OUTSIDE our island. This is
+         what let a mining node sit 20+ blocks behind until someone restarted.
     """
     delay = 30
     last_height = -1
     stuck_for = 0
+    last_reseed = 0.0
+    baseline = time.time()            # if we never adopt, measure "marooned" from here
     while True:
         time.sleep(delay)
+        now = time.time()
         with node.lock:
             alone = not node.peers
             height = len(node.chain.chain)
+        mining = not getattr(node, "seed_only", False)
 
-        # Having a peer is not the same as being on the network. Two nodes on
-        # one desk will happily find each other, agree they are both at block
-        # three, and sit there for ever -- neither is ahead, so neither syncs,
-        # and because a peer exists nothing ever went back to the seed list.
-        # A miner in China spent an evening in exactly that state. So: if the
-        # chain has not moved in a few minutes, treat it as isolation and go
-        # looking for a way in again, peers or no peers.
+        # (1) plain isolation: height frozen
         if height == last_height:
             stuck_for += 1
         else:
             stuck_for = 0
             last_height = height
 
-        if alone or stuck_for >= 6:
-            if load_seeds(node) and not alone:
+        # (2) miner isolation: no network-sourced progress in a while.
+        # _last_peer_adopt is stamped by sync_chain whenever a peer is strictly
+        # ahead of us or we adopt their chain. Our OWN mined blocks never touch
+        # it -- which is the whole point.
+        last_adopt = getattr(node, "_last_peer_adopt", baseline)
+        marooned = (mining
+                    and (now - last_adopt) > 300      # ~5 min with nobody ahead
+                    and (now - last_reseed) > 120)    # but re-seed at most every 2 min
+
+        if alone or stuck_for >= 6 or marooned:
+            found = load_seeds(node)
+            last_reseed = now
+            if found and not alone:
                 stuck_for = 0        # found fresh addresses; give them a chance
-            elif alone and load_seeds(node):
+            elif alone and found:
                 return
             delay = min(delay * 2, 600) if alone else 30
         else:
