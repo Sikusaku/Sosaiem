@@ -127,7 +127,7 @@ ACTIVE_VALIDATOR_WINDOW = 15 * 60
 # window, faster syncing, bug fixes that only tighten what was already invalid.
 # Nobody has to agree on it and nothing can split over it.
 PROTOCOL_VERSION = 4
-NODE_VERSION = "2.15.11"   # + all-time transfer history in explorer; miner self-heal when left behind
+NODE_VERSION = "2.15.12"   # + parallel block broadcast: blocks reach miners faster, less trailing
 
 # Blocks may carry a small tag naming the build that made them. It is accepted
 # and recorded, never required. A rule that forces everyone onto a particular
@@ -2745,8 +2745,19 @@ def handle_incoming_block(node, block):
 
 def broadcast_block(node, block):
     payload = block_to_dict(block)
+    # Fan the block out to every peer AT ONCE. A block is a few KB; the only job
+    # here is speed. Sent sequentially, a dead or slow address earlier in the set
+    # made every live miner behind it wait out its timeout before the block even
+    # left -- and because each re-broadcast hop repeated that stall, the delay
+    # compounded and miners trailed the tip by a block or two. Same pattern
+    # sync_chain already uses: hand the sends to the shared out-pool so dead peers
+    # time out on their own threads, not in front of everyone. Fire-and-forget is
+    # safe because push_chain re-offers any missing block every tick.
     for peer in list(node.peers):
-        post_json(peer.rstrip("/") + "/block", payload)
+        try:
+            _out_pool.submit(post_json, peer.rstrip("/") + "/block", payload, 5)
+        except Exception:
+            pass
 
 
 def push_chain(node):
