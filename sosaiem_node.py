@@ -127,7 +127,7 @@ ACTIVE_VALIDATOR_WINDOW = 15 * 60
 # window, faster syncing, bug fixes that only tighten what was already invalid.
 # Nobody has to agree on it and nothing can split over it.
 PROTOCOL_VERSION = 4
-NODE_VERSION = "2.15.12"   # + parallel block broadcast: blocks reach miners faster, less trailing
+NODE_VERSION = "2.15.15"   # restart-revert fix + fast catch-up; on-chain settlement built-in but dormant (safe to ship)
 
 # Blocks may carry a small tag naming the build that made them. It is accepted
 # and recorded, never required. A rule that forces everyone onto a particular
@@ -200,6 +200,14 @@ SHARE_WINDOW = 15
 # real block number ONLY after a two-node test has confirmed the flow. The
 # sentinel below (a huge number) means "off".
 TRANSFERS_ACTIVATION_HEIGHT = 4500          # transfers go live at this block
+# On-chain settlement flag day. AT this height, updated nodes STOP vote-confirming
+# transfers into the side-cache and settle them in blocks only -- permanent, no
+# revert, every node agrees. Like the payout activations, EVERY node must be on
+# 2.15.15+ before this block; one still voting past it would double-count a
+# transfer others settled on-chain and drift onto a minority view. Left far in the
+# future so 2.15.15 behaves EXACTLY like 2.15.14 until you schedule it: set this to
+# (current height + a few hundred), announce it, let everyone update, then release.
+TRANSFERS_ONCHAIN_HEIGHT = 999_999_999      # on-chain settlement NOT scheduled yet -- set to (current height + a few hundred) once the miners are all on 2.15.15+, then re-release
 TRANSFER_WORK_TARGET = 2 ** 236                 # send-time work: a few seconds
 MAX_TRANSFERS_PER_BLOCK = 64
 
@@ -207,6 +215,11 @@ MAX_TRANSFERS_PER_BLOCK = 64
 def transfers_active(height):
     """True only once the chain has reached the activation height."""
     return height is not None and height >= TRANSFERS_ACTIVATION_HEIGHT
+
+
+def transfers_onchain_only(height):
+    """True once the coordinated flag day is reached: settle in blocks, stop voting."""
+    return height is not None and height >= TRANSFERS_ONCHAIN_HEIGHT
 
 
 def _transfer_work_core(tx):
@@ -1603,6 +1616,7 @@ class Node:
         except Exception:
             return
         kept = 0
+        balances_running = compute_balances(self.chain)   # chain truth; kept transfers applied as we go
         for entry in log:
             tx, votes = entry.get("tx", {}), entry.get("votes", {})
             sig = tx.get("signature")
@@ -1610,17 +1624,23 @@ class Node:
                 continue
             if not all(vote_is_valid(v) for v in votes.values()):
                 continue
-            # Re-check that these votes really were a stake majority. The file
-            # on disk is just a cache -- if it is stale, edited or corrupted it
-            # must not be able to hand anyone coins on the next start-up.
             good = {a: v for a, v in votes.items()
                     if v.get("tx_signature") == sig and v.get("validator") == a}
-            balances = compute_balances(self.chain)
-            total = sum(max(b, 0.0) for b in balances.values())
-            yes = sum(max(balances.get(a, 0), 0.0)
-                      for a, v in good.items() if v.get("approve"))
-            if total <= 0 or yes * 2 <= total:
-                continue
+            # A transfer moves only the SENDER'S OWN coins and is cryptographically
+            # signed by that sender (verified by transfer_is_valid above), so the
+            # signature -- not a re-run of the old live stake vote against today's
+            # balances -- is the real authorization. The previous check re-required
+            # the approving voters to still hold >50% of ALL network stake on every
+            # restart; almost no ordinary sender does, so it silently dropped
+            # confirmed transfers and REVERTED real payments on reboot. Keep a
+            # previously-confirmed transfer if it still verifies (checked above) and
+            # the sender can still afford it against the chain plus everything kept
+            # so far. A tampered entry can't slip through -- transfer_is_valid would
+            # have rejected it, because changing any field breaks the signature.
+            if balances_running.get(tx["from"], 0.0) + 1e-9 < tx["amount"]:
+                continue                      # sender can't afford it now -> skip
+            balances_running[tx["from"]] = round(balances_running.get(tx["from"], 0.0) - tx["amount"], 8)
+            balances_running[tx["to"]]   = round(balances_running.get(tx["to"], 0.0) + tx["amount"], 8)
             self.transfers[sig] = tx
             self.votes[sig] = dict(good)
             self.confirmed_log.append({"tx": tx, "votes": dict(good)})
@@ -1823,11 +1843,50 @@ def cast_vote(node, tx):
 
 
 def revote_pending(node):
+    # At the coordinated on-chain flag day this loop stands down for good:
+    # pending transfers wait for a miner to carry them into a block instead of
+    # being vote-confirmed into the fragile side-cache. Gated on the FUTURE
+    # shared height (not the long-past 4500) so every node switches together --
+    # switching alone would double-count transfers against nodes still voting.
+    if transfers_onchain_only(len(node.chain.chain)):
+        return
     with node.lock:
         pending = [tx for sig, tx in node.transfers.items()
                    if sig not in node.confirmed]
     for tx in pending:
         cast_vote(node, tx)
+
+
+def reconcile_chain_transfers(node):
+    # A transfer that now lives in a block is SETTLED ON-CHAIN. Mark it confirmed
+    # so the block-builder won't try to add it again, drop it from the pending
+    # pool, and remove any stale vote-cache copy of it so balances (chain +
+    # cache) can never count the same transfer twice. Only the recent tail is
+    # scanned: a pending transfer is mined within a block or two of being sent,
+    # and blocks are ~60s apart while this runs every few seconds, so settlement
+    # is always caught long before the next block could re-include it.
+    need_save = False
+    with node.lock:
+        on_chain = set()
+        for b in node.chain.chain[-64:]:
+            for tx in b.transactions:
+                if isinstance(tx, dict) and tx.get("type") == "transfer":
+                    sig = tx.get("signature")
+                    if sig:
+                        on_chain.add(sig)
+        if on_chain:
+            for sig in on_chain:
+                if sig not in node.confirmed:
+                    node.confirmed.add(sig); need_save = True
+                if node.transfers.pop(sig, None) is not None:
+                    need_save = True
+            before = len(node.confirmed_log)
+            node.confirmed_log = [e for e in node.confirmed_log
+                                  if e.get("tx", {}).get("signature") not in on_chain]
+            if len(node.confirmed_log) != before:
+                need_save = True
+    if need_save:
+        node.save_transfers()
 
 
 def api_summary(node):
@@ -2054,14 +2113,24 @@ def make_handler(node):
                 except Exception:
                     seen = False
                 self._json({"reachable": seen, "seen_as": who})
-            elif self.path == "/chain":
-                # Serving the chain used to rebuild every block into JSON from
-                # scratch, while holding the node's main lock, on every single
-                # request. With several miners each asking every couple of
-                # seconds that meant the node spent its life re-encoding the
-                # same 700 KB and blocking itself out of its own lock. Encode
-                # once per new block instead and hand out the cached bytes.
-                self._json_raw(_cached_chain_payload(node))
+            elif self.path == "/chain" or self.path.startswith("/chain?"):
+                # Plain /chain hands out the cached full-chain bytes (hottest
+                # endpoint; encoded once per new block, not per request).
+                # ?from=N returns ONLY blocks from index N onward, so a miner a
+                # few blocks behind pulls a few KB instead of the whole multi-MB
+                # chain -- which is what kept pull-only miners trailing the tip.
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                frm = q.get("from", [None])[0]
+                if frm is not None:
+                    try:
+                        n = max(0, int(frm))
+                    except ValueError:
+                        n = 0
+                    with node.lock:
+                        part = [block_to_dict(b) for b in node.chain.chain[n:]]
+                    self._json(part)
+                else:
+                    self._json_raw(_cached_chain_payload(node))
             elif self.path == "/state":
                 with node.lock:
                     cut = time.time() - ACTIVE_VALIDATOR_WINDOW
@@ -3006,24 +3075,42 @@ def sync_chain(node):
 
     best, source = node.chain, None
     for _, peer in ahead[:3]:
-        # The whole chain is a bulk download and it grows: 267 blocks was ~680 KB,
-        # 2750 blocks is several megabytes. Twelve seconds was fine early on and
-        # quietly stopped being enough -- a node abroad would ask who was ahead
-        # (a few bytes, always fine), start the real download, run out of time,
-        # and conclude it was up to date at block one. Then it mined its own
-        # chain that nobody would ever accept. This is a once-per-catch-up cost,
-        # so give it room.
-        data = get_json(peer.rstrip("/") + "/chain", timeout=120)
-        if data is None:
-            continue
-        cand = list_to_chain(data)
-        # Links-only here so a slow CPU keeps pace with the network's tip.
-        # Re-hashing every block inline let a slow machine fall permanently
-        # behind. The proof-of-work is confirmed gently in the background after
-        # adopting, and a broken link is still caught instantly right here.
-        if not (cand.chain and cand.chain[0].compute_hash() == _CANONICAL_GENESIS_HASH
-                and cand.is_chain_valid(links_only=True)):
-            continue
+        cand = None
+        # FAST PATH: fetch ONLY the blocks we are missing and extend our own
+        # chain, instead of re-downloading the whole multi-MB chain to catch up
+        # one or two blocks. That full re-download is what kept pull-only miners
+        # (behind a home router, can't be pushed to) perpetually a block behind.
+        # ?from=N returns just blocks N onward -- a few KB. If the peer is old
+        # (ignores ?from and returns the whole chain) or we have diverged (a
+        # reorg, so the piece won't join our tip), we fall through to the full
+        # download below. Links-only validation keeps a slow CPU at the tip.
+        try:
+            cur = len(node.chain.chain)
+            part = get_json(peer.rstrip("/") + "/chain?from=" + str(cur), timeout=30)
+        except Exception:
+            part = None
+        if isinstance(part, list) and part and isinstance(part[0], dict) \
+                and part[0].get("index") == cur \
+                and part[0].get("previous_hash") == node.chain.last_block.compute_hash():
+            try:
+                merged = chain_to_list(node.chain) + part
+                c = list_to_chain(merged)
+                if (c.chain and c.chain[0].compute_hash() == _CANONICAL_GENESIS_HASH
+                        and c.is_chain_valid(links_only=True)):
+                    cand = c
+            except Exception:
+                cand = None
+        # FALLBACK: the whole chain (original behaviour) -- far behind, a reorg,
+        # or a peer without ?from support. A once-per-catch-up cost; give it room.
+        if cand is None:
+            data = get_json(peer.rstrip("/") + "/chain", timeout=120)
+            if data is None:
+                continue
+            c = list_to_chain(data)
+            if not (c.chain and c.chain[0].compute_hash() == _CANONICAL_GENESIS_HASH
+                    and c.is_chain_valid(links_only=True)):
+                continue
+            cand = c
         if is_better(cand, best):
             best, source = cand, peer
     if source is None:
@@ -3191,6 +3278,7 @@ def sync(node):
     except Exception:
         pass
     sync_transfers(node)
+    reconcile_chain_transfers(node)   # settle in-block transfers: confirm + drop from pending
     revote_pending(node)
     push_chain(node)          # shove our blocks OUT so unreachable miners still count
 

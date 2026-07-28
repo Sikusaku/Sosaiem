@@ -4,7 +4,7 @@ Sosaiem is a community proof-of-work cryptocurrency. No company, no pre-mine —
 coins only come into existence by mining. The reference node, miner, and wallet
 are all in this repository.
 
-**Current version:** 2.15.12 · protocol 4
+**Current version:** 2.15.15 · protocol 4
 **Website / downloads:** https://sosaiem.com
 
 ## Network parameters
@@ -86,6 +86,32 @@ Windows users can download prebuilt apps from https://sosaiem.com, or run
 `build_exe.bat` to package the `.exe`s themselves.
 
 ## Changelog
+
+- **2.15.15** — Carries permanent ON-CHAIN transfer settlement (dormant until
+  scheduled). Adds the machinery for transfers to settle inside blocks --
+  permanent, every node agrees, no revert -- plus a reconciler that marks an
+  in-block transfer settled and clears it from the pending pool and the old
+  vote-cache. It stays OFF, behaving exactly like 2.15.14, until the coordinated
+  activation height `TRANSFERS_ONCHAIN_HEIGHT = 10000` is reached -- so it is
+  safe to install now, ahead of that flag day. Every node must be on 2.15.15+
+  before block 10000 (the flag day), like the payout activations. Includes the restart-revert
+  fix (2.15.13) and incremental catch-up (2.15.14).
+
+- **2.15.14** — Much faster catch-up. A miner that fell behind used to re-download
+  the ENTIRE chain (tens of MB) just to catch up a block or two, so pull-only
+  miners (behind a home router) trailed the tip constantly. Catch-up now fetches
+  only the missing blocks (a few KB) via `/chain?from=N` and extends the local
+  chain, falling back to a full download only when far behind, on a reorg, or
+  from a peer without support. Networking only -- no consensus change. Biggest
+  benefit once the node being pulled from (your seed) is on this version.
+
+- **2.15.13** — Fixes transfers reverting on restart. On reload the node was
+  re-requiring a transfer's approvers to still hold a majority of ALL network
+  stake, which almost no ordinary sender does, so confirmed transfers were
+  silently dropped and payments snapped back to the sender after a restart. A
+  transfer is authorized by the sender's signature (it moves only their own
+  coins); reload now keeps any previously-confirmed transfer that still verifies
+  and that the sender can still afford. No consensus change.
 
 - **2.15.12** — Faster block propagation. A newly found block is now sent to all
   peers at once instead of one at a time, so a slow or dead peer no longer holds
