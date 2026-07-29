@@ -94,6 +94,35 @@ GAP_CAP = 2 * TARGET_BLOCK_SECONDS
 EXPECT = 0.75
 
 
+# ---------------------------------------------------------------------------
+# LWMA-1 difficulty (Zawy) -- activates at the v5 flag day. Retargets EVERY block
+# on a short linearly-weighted window, so difficulty tracks hashrate tightly. This
+# is what stops a miner from running ahead onto a private fork: with difficulty
+# kept honest, a lone miner mines at the true rate and can't outpace the network.
+# Below LWMA_HEIGHT the OLD rule runs unchanged, so the existing chain validates
+# exactly as before and updated/old nodes agree until the flag day.
+# ---------------------------------------------------------------------------
+LWMA_HEIGHT = 10750      # flag day (set to match CONSENSUS_V5_HEIGHT before release). 999_999_999 = OFF.
+LWMA_N = 10
+
+def _lwma_at(blocks, i, out):
+    n = min(LWMA_N, i - 1)
+    if n < 1:
+        return out[i - 1] if i >= 1 else INITIAL_TARGET
+    weighted = 0.0
+    total_diff = 0.0
+    for k in range(1, n + 1):
+        j = i - (n - k + 1)                     # oldest .. newest of the window
+        st = blocks[j].timestamp - blocks[j - 1].timestamp
+        st = max(-5 * TARGET_BLOCK_SECONDS, min(st, 6 * TARGET_BLOCK_SECONDS))
+        weighted += k * st                      # newest block gets the largest weight
+        total_diff += MAX_TARGET / max(1, out[j])
+    weighted = max(weighted, n * n * TARGET_BLOCK_SECONDS / 20.0)   # low-clamp (anti-runaway)
+    kk = n * (n + 1) / 2.0
+    next_diff = total_diff * kk * TARGET_BLOCK_SECONDS / (n * weighted)
+    next_diff = max(1.0, next_diff)
+    return max(1, min(int(MAX_TARGET / next_diff), MAX_TARGET))
+
 def _target_sequence(blocks, extra=0):
     out = []
     cur = INITIAL_TARGET
@@ -103,7 +132,9 @@ def _target_sequence(blocks, extra=0):
             out.append(MAX_TARGET)
             continue
 
-        if i >= ADJUST_WINDOW + 2 and (i - 2) % ADJUST_WINDOW == 0:
+        if i >= LWMA_HEIGHT:
+            cur = _lwma_at(blocks, i, out)       # v5: LWMA every block
+        elif i >= ADJUST_WINDOW + 2 and (i - 2) % ADJUST_WINDOW == 0:
             span = 0.0
             for j in range(i - ADJUST_WINDOW, i):
                 gap = blocks[j].timestamp - blocks[j - 1].timestamp

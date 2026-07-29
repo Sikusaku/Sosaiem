@@ -8,6 +8,10 @@ import uuid
 import random
 import socket
 import hashlib
+# HARD CAP: no socket operation anywhere may hang longer than this. Without it,
+# a dead or slow peer (common during a hash war) freezes a worker thread forever;
+# once every worker is frozen, the node can't answer the mint and appears 'down'.
+socket.setdefaulttimeout(30)
 import threading
 import collections
 import urllib.parse
@@ -36,7 +40,7 @@ class ThreadingHTTPServer(_BaseHTTPServer):
 
     def process_request(self, request, client_address):
         if self._pool is None:
-            type(self)._pool = ThreadPoolExecutor(max_workers=16,
+            type(self)._pool = ThreadPoolExecutor(max_workers=64,
                                                   thread_name_prefix="sos-http")
         self._pool.submit(self._handle_pooled, request, client_address)
 
@@ -99,7 +103,7 @@ def _unfreeze_windows_console():
 
 from wallet import Wallet, verify_signature, WalletLocked, WrongPassword
 from blockchain import (Blockchain, Block, next_target, compute_targets,
-                        MAX_TARGET, memory_hard)
+                        MAX_TARGET, memory_hard, LWMA_HEIGHT)
 from coin import (compute_balances, total_minted, remaining_supply,
                   make_transfer, make_reward, transfer_is_valid, amount_is_sane,
                   _address_from_pubkey, BLOCK_REWARD, MAX_SUPPLY,
@@ -127,7 +131,7 @@ ACTIVE_VALIDATOR_WINDOW = 15 * 60
 # window, faster syncing, bug fixes that only tighten what was already invalid.
 # Nobody has to agree on it and nothing can split over it.
 PROTOCOL_VERSION = 4
-NODE_VERSION = "2.15.15"   # restart-revert fix + fast catch-up; on-chain settlement built-in but dormant (safe to ship)
+NODE_VERSION = "2.16.0"    # v5 (DORMANT until flag day = blockchain.LWMA_HEIGHT): LWMA difficulty + on-chain transfers. Always-on: sync-filter fix.
 
 # Blocks may carry a small tag naming the build that made them. It is accepted
 # and recorded, never required. A rule that forces everyone onto a particular
@@ -207,7 +211,18 @@ TRANSFERS_ACTIVATION_HEIGHT = 4500          # transfers go live at this block
 # transfer others settled on-chain and drift onto a minority view. Left far in the
 # future so 2.15.15 behaves EXACTLY like 2.15.14 until you schedule it: set this to
 # (current height + a few hundred), announce it, let everyone update, then release.
-TRANSFERS_ONCHAIN_HEIGHT = 999_999_999      # on-chain settlement NOT scheduled yet -- set to (current height + a few hundred) once the miners are all on 2.15.15+, then re-release
+# ============================ CONSENSUS v5 FLAG DAY ==========================
+# ONE height at which everything switches on together for every updated node:
+#   * LWMA difficulty (stops runaway forks -- keeps difficulty honest per block)
+#   * on-chain transfer settlement (reliable transfers/escrow, in blocks)
+# Below this height the node behaves EXACTLY like v4 (same difficulty, same
+# transfer rules), so updated and not-yet-updated nodes agree until the flag day.
+# To schedule the flag day: set LWMA_HEIGHT in blockchain.py to (current height +
+# a few hundred), which drives BOTH changes. 999_999_999 = OFF (safe to deploy now).
+CONSENSUS_V5_HEIGHT = LWMA_HEIGHT     # transfers activate at the same height as LWMA
+# ============================================================================
+
+TRANSFERS_ONCHAIN_HEIGHT = CONSENSUS_V5_HEIGHT   # transfers go on-chain at the flag day
 TRANSFER_WORK_TARGET = 2 ** 236                 # send-time work: a few seconds
 MAX_TRANSFERS_PER_BLOCK = 64
 
@@ -3003,6 +3018,9 @@ def handle_incoming_vote(node, vote):
     return "ok"
 
 
+MAX_FORK_DEPTH = 25      # how far "behind" a peer can be and still be checked as a
+                         # possible better (heavier) chain -- lets a node climb off a fork
+
 def sync_chain(node):
     if not node.peers:
         return
@@ -3045,7 +3063,12 @@ def sync_chain(node):
                     info = fut.result(timeout=0)
                 except Exception:
                     continue
-                if info and isinstance(info.get("blocks"), int) and info["blocks"] >= mine:
+                # Consider peers even if I'm a few blocks "ahead" of them: I might
+                # be ahead ON A FORK, and the real chain can be shorter. is_better
+                # (heaviest-chain, post-flag) then correctly drops my fork for the
+                # heavier honest chain. MAX_FORK_DEPTH bounds the extra downloads.
+                if info and isinstance(info.get("blocks"), int) \
+                        and info["blocks"] >= mine - MAX_FORK_DEPTH:
                     ahead.append((info["blocks"], p))
                 # enough to work with, and someone is ahead: stop waiting
                 if len(ahead) >= 3:
@@ -3550,10 +3573,11 @@ def _seed_sources(node):
     the address baked into this build.
     """
     sources = []
-    if getattr(node, "isolated", False):
+    if "--isolated" in sys.argv:
         # --isolated: talk to nobody but peers we were explicitly handed. This is
         # what keeps a local test from reaching the real network and pulling the
-        # live chain into the test.
+        # live chain into the test. (Checked via sys.argv because load_seeds runs
+        # before node.isolated is assigned.)
         with node.lock:
             remembered = sorted(node.peers)
         return [("test peers", remembered)] if remembered else []
@@ -3828,6 +3852,8 @@ def open_the_door(node):
 def meet(node, peer):
     if peer == node.my_url or peer in node.peers:
         return False
+    if "--isolated" in sys.argv and "127.0.0.1" not in peer and "localhost" not in peer:
+        return False          # test mode: only local test peers, never the real node
     node.peers.add(peer)
     node.save_peers()
     introduce_self(node, peer)
@@ -4371,8 +4397,9 @@ def main():
     node = Node(port)
     start_server(node)
     threading.Thread(target=auto_sync_loop, args=(node,), daemon=True).start()
-    threading.Thread(target=discovery_beacon, args=(node,), daemon=True).start()
-    threading.Thread(target=discovery_listener, args=(node,), daemon=True).start()
+    if "--isolated" not in sys.argv:      # test mode: no LAN discovery -> stays sealed off
+        threading.Thread(target=discovery_beacon, args=(node,), daemon=True).start()
+        threading.Thread(target=discovery_listener, args=(node,), daemon=True).start()
     print(f"  This node's address: {node.wallet.address()}")
     print(f"  Browser wallet:      http://localhost:{port}   (dashboard, send, mine)")
     print("  Other Sosaiem nodes on this machine/wifi will be found automatically.")
@@ -4403,11 +4430,12 @@ def main():
                 node.mine_threads = max(1, min(32, int(arg.split("=", 1)[1])))
             except ValueError:
                 pass
-    threading.Thread(target=open_the_door, args=(node,), daemon=True).start()
-    threading.Thread(target=retry_bootstrap, args=(node,), daemon=True).start()
-    threading.Thread(target=seed_keeper, args=(node,), daemon=True).start()
-    threading.Thread(target=nostr_announce_loop, args=(node,), daemon=True).start()
-    threading.Thread(target=nostr_discover_loop, args=(node,), daemon=True).start()
+    if "--isolated" not in sys.argv:
+        threading.Thread(target=open_the_door, args=(node,), daemon=True).start()
+        threading.Thread(target=retry_bootstrap, args=(node,), daemon=True).start()
+        threading.Thread(target=seed_keeper, args=(node,), daemon=True).start()
+        threading.Thread(target=nostr_announce_loop, args=(node,), daemon=True).start()
+        threading.Thread(target=nostr_discover_loop, args=(node,), daemon=True).start()
 
     # When there is no keyboard attached -- running under systemd, in a
     # container, piped from anything -- there is no console to read. Reading
