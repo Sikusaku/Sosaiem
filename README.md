@@ -16,7 +16,39 @@ stake-voting/on-chain settlement moves it. One ledger, open to everyone.
 
 Requires Python 3. Dependencies are standard-library plus the bundled modules.
 
-## Current release — v2.16.0
+## Current release — v2.17.0
+
+This release ships the **v6 consensus rules**, which are **dormant** until a
+coordinated activation height (`CONSENSUS_V6_HEIGHT` in `sosaiem_node.py`, set to
+**11750**). Below that height the node behaves exactly like v2.16.0, so updated and
+not-yet-updated nodes agree until the flag day. At the activation height, for every
+updated node, these switch on together:
+
+- **Work-based fork choice** — the heaviest (most cumulative proof-of-work) chain
+  wins, not merely the longest. LWMA makes per-block work vary, so "longest" could
+  pick a longer low-work fork over a shorter honest one; this closes that.
+- **Median-time-past timestamps** — a block's timestamp must exceed the median of
+  the previous 11 blocks, so a miner can't feed LWMA backwards times to skew
+  difficulty. Fully deterministic (no wall clock), so no node's clock can disagree.
+
+Also in this release (always on, no flag day needed):
+- **Push-delivery fix** — `push_chain` no longer treats a peer's "resync"/"duplicate"
+  reply as successful delivery, so a home miner stuck on a fork actually receives
+  the chain instead of silently staying behind.
+- **Verified-cache eviction** — the proof cache drops its oldest entries at the cap
+  instead of wiping everything, so a chain longer than the cap no longer triggers a
+  full re-verification storm.
+- **Push/pull agreement** — `handle_submit_chain` and `is_better` now agree on
+  equal-length chains, so a pushed equal-height reorg no longer silently fails.
+
+### Activation / flag day
+
+`sosaiem_node.py` sets `CONSENSUS_V6_HEIGHT`. This exact value must be identical on
+**every** node and in every build (the zip, both .exes, the seed node, every miner).
+Nodes on a different value fork at that height. `999_999_999` means the v6 rules are
+off. Everyone must be on v2.17.0 before block 11750.
+
+## Previous release — v2.16.0
 
 This release ships the **v5 consensus rules**, which are **dormant** until a
 coordinated activation height (`LWMA_HEIGHT` in `blockchain.py`). Below that height

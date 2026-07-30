@@ -131,7 +131,7 @@ ACTIVE_VALIDATOR_WINDOW = 15 * 60
 # window, faster syncing, bug fixes that only tighten what was already invalid.
 # Nobody has to agree on it and nothing can split over it.
 PROTOCOL_VERSION = 4
-NODE_VERSION = "2.16.0"    # v5 (DORMANT until flag day = blockchain.LWMA_HEIGHT): LWMA difficulty + on-chain transfers. Always-on: sync-filter fix.
+NODE_VERSION = "2.17.0"    # v6 (DORMANT until height 11750): work-based fork choice + median-time-past timestamps. Always-on: push-delivery fix, verified-cache eviction, submit_chain/is_better alignment.
 
 # Blocks may carry a small tag naming the build that made them. It is accepted
 # and recorded, never required. A rule that forces everyone onto a particular
@@ -221,6 +221,30 @@ TRANSFERS_ACTIVATION_HEIGHT = 4500          # transfers go live at this block
 # a few hundred), which drives BOTH changes. 999_999_999 = OFF (safe to deploy now).
 CONSENSUS_V5_HEIGHT = LWMA_HEIGHT     # transfers activate at the same height as LWMA
 # ============================================================================
+
+# ============================ CONSENSUS v6 FLAG DAY ==========================
+# TWO consensus fixes switch on together here, for every updated node:
+#   * work-based fork choice  -- the heaviest (most cumulative work) chain wins,
+#     not merely the longest. LWMA makes per-block work vary, so "longest" can
+#     pick a longer LOW-work fork over a shorter honest one; this closes that.
+#   * median-time-past timestamps -- a block's timestamp must exceed the median
+#     of the previous 11, so a miner can't feed LWMA fake (backwards) times to
+#     game difficulty. Fully deterministic (no wall-clock), so no node's clock
+#     can make it disagree.
+# BOTH are consensus changes: an updated node and a not-yet-updated one will
+# pick different tips / accept different blocks above this height. So this MUST
+# be a coordinated flag day set ABOVE the current tip, announced, with everyone
+# on the same build before it is reached -- exactly like the v5 flag day.
+# Set to (current height + a few hundred) once the network is unified. A value
+# at/above the live tip means the rules are OFF on every node running this build,
+# so it is always SAFE to deploy first and schedule second.
+CONSENSUS_V6_HEIGHT = 11750      # 999_999_999 = OFF (safe to deploy now)
+
+
+def v6_active(height):
+    """True once the chain has reached the v6 flag day."""
+    return height is not None and height >= CONSENSUS_V6_HEIGHT
+
 
 TRANSFERS_ONCHAIN_HEIGHT = CONSENSUS_V5_HEIGHT   # transfers go on-chain at the flag day
 TRANSFER_WORK_TARGET = 2 ** 236                 # send-time work: a few seconds
@@ -1111,7 +1135,14 @@ def _check_block_content(transactions, prev_hash, share_target, height=None,
 # already accepted would make start-up take hours -- but the cheap structural
 # checks below still run on every block every time, so a tampered old block
 # still breaks the links and gets caught.
-_verified_work = set()
+#
+# A dict, not a set, so it stays insertion-ordered: at the cap we drop the OLDEST
+# entries instead of wiping the whole thing. On a chain longer than the cap (a
+# set wipe happened every time it filled -- about every two weeks at 60s blocks),
+# the wipe forced a full re-verification storm; evicting the oldest keeps the
+# recent tip verified, which is all that matters. Membership tests, iteration and
+# sorted() all work on the keys exactly as they did on the set.
+_verified_work = {}
 
 # Only one background verification may run at a time, and it only looks at the
 # most recent blocks. Older ones were checked when they arrived and now sit
@@ -1155,9 +1186,11 @@ _VERIFIED_CAP = 20000
 
 
 def _remember_verified(block_id):
-    if len(_verified_work) >= _VERIFIED_CAP:
-        _verified_work.clear()
-    _verified_work.add(block_id)
+    # Drop the oldest entries down to just under the cap, then record this one.
+    # (Insertion order is preserved by dict, so next(iter(...)) is the oldest.)
+    while len(_verified_work) >= _VERIFIED_CAP:
+        _verified_work.pop(next(iter(_verified_work)), None)
+    _verified_work[block_id] = True
 
 
 def _tips_before(chain_list, index):
@@ -1227,10 +1260,41 @@ def validate_full_chain(chain):
     return True
 
 
+MTP_WINDOW = 11      # median-time-past window (last 11 blocks, like Bitcoin)
+
+
+def median_time_past(chain_list, upto_index):
+    """
+    The median timestamp of the up-to-11 blocks ending just before `upto_index`.
+    A new block's timestamp must be strictly greater than this. It is a PAST-only,
+    fully deterministic bound -- no wall clock -- so every node computes the same
+    value and none can disagree because its clock differs. It stops a miner from
+    stamping a block with a backwards time to skew LWMA difficulty downward.
+    """
+    lo = max(0, upto_index - MTP_WINDOW)
+    times = sorted(b.timestamp for b in chain_list[lo:upto_index])
+    if not times:
+        return None
+    return times[len(times) // 2]
+
+
+def timestamp_ok(chain_list, block):
+    """v6 rule: block time must be above the median of the previous 11. Below the
+    v6 flag day this always passes, so existing history is unaffected."""
+    if not v6_active(block.index):
+        return True
+    mtp = median_time_past(chain_list, block.index)
+    if mtp is None:
+        return True
+    return block.timestamp > mtp
+
+
 def validate_new_block(chain, block, share_chain=None):
     if block.previous_hash != chain.last_block.compute_hash():
         return False
     if block.index != chain.last_block.index + 1:
+        return False
+    if not timestamp_ok(chain.chain, block):
         return False
     target = next_target(chain.chain)
     if int(block.pow_hash(), 16) >= target:
@@ -1269,8 +1333,35 @@ def loads_strict(text):
     return json.loads(text, parse_constant=_no_constants)
 
 
+def _chain_work(chain):
+    """
+    Total cumulative proof-of-work in a chain: the sum, over every block, of how
+    many attempts that block's difficulty demands on average (MAX_TARGET/target).
+    A harder block (smaller target) contributes more, so this measures real work
+    done, not block count. Deterministic: every node derives the same targets
+    from the same blocks and gets the same total.
+    """
+    targets = compute_targets(chain.chain)
+    total = 0
+    for t in targets:
+        total += MAX_TARGET // max(1, t)
+    return total
+
+
 def is_better(candidate, current):
     lc, cc = len(candidate.chain), len(current.chain)
+    # v6: heaviest chain wins. Both tips must be past the flag day, so a mixed
+    # network still agrees by length below it and only switches to work-based
+    # selection together, at the coordinated height. Below v6 this is exactly the
+    # old length rule, so nothing changes for existing history.
+    ctip = candidate.chain[-1].index if candidate.chain else -1
+    utip = current.chain[-1].index if current.chain else -1
+    if v6_active(ctip) and v6_active(utip):
+        wc, wu = _chain_work(candidate), _chain_work(current)
+        if wc != wu:
+            return wc > wu
+        # equal work -> lowest tip hash, so every node breaks the tie identically
+        return candidate.chain[-1].compute_hash() < current.chain[-1].compute_hash()
     if lc != cc:
         return lc > cc
     return candidate.chain[-1].compute_hash() < current.chain[-1].compute_hash()
@@ -1523,7 +1614,7 @@ class Node:
                 with open(self._verified_file()) as f:
                     for h in json.load(f):
                         if isinstance(h, str):
-                            _verified_work.add(h)
+                            _verified_work[h] = True
         except Exception:
             pass
 
@@ -2878,9 +2969,26 @@ def push_chain(node):
                 missing = [block_to_dict(b) for b in node.chain.chain[peer_blocks:]]
             sent_all = True
             for blk in missing:
-                if post_json(base + "/block", blk, timeout=15) is None:
-                    sent_all = False
-                    break
+                # A reply is not the same as delivery. /block answers with a JSON
+                # result even when it did NOT apply the block -- "resync" (the peer
+                # is on a different history and asked us to sync instead) or
+                # "duplicate". Treating any non-None reply as success meant a home
+                # peer sitting on a fork looked "caught up" here while it had
+                # actually received nothing, so it never got the chain by push and
+                # could stay stuck behind for good. Only "accepted" (or a peer that
+                # is already at/above this block) counts as the block landing; on
+                # anything else, fall through to the full submit_chain below, which
+                # can carry a genuine reorg.
+                resp = post_json(base + "/block", blk, timeout=15)
+                res = resp.get("result") if isinstance(resp, dict) else None
+                if res == "accepted":
+                    continue
+                if res == "duplicate":
+                    # peer already had THIS block; keep offering the later ones
+                    continue
+                # None (network fail) or "resync" (fork) -> block-by-block won't take
+                sent_all = False
+                break
             if sent_all:
                 continue
 
@@ -2898,12 +3006,28 @@ def handle_submit_chain(node, data):
     except Exception:
         return "bad"
     with node.lock:
-        # fast reject: only a strictly longer chain can win, so don't pay for
-        # full validation of same/shorter chains that get pushed constantly
-        if len(cand.chain) <= len(node.chain.chain):
-            return "kept"
+        # fast reject: skip full validation of chains that clearly can't win, so
+        # the constant stream of same/shorter pushes stays cheap. Below the v6
+        # flag day "can't win" == "not strictly longer" (the old length rule).
+        # At/after it a shorter-but-heavier chain CAN win, so a same-or-shorter
+        # push is only rejected outright while we're still below the flag; above
+        # it we let is_better (work-aware) decide, since it may legitimately
+        # prefer a shorter heavier chain. An identical chain is always dropped.
         cur_len = len(node.chain.chain)
+        cand_len = len(cand.chain)
         cur_tip = node.chain.chain[-1].compute_hash() if node.chain.chain else None
+        cand_tip = cand.chain[-1].compute_hash() if cand.chain else None
+        if cand_tip == cur_tip:
+            return "kept"                     # exactly what we already have
+        both_past_v6 = (v6_active(cand_len - 1) and v6_active(cur_len - 1))
+        # Cheap reject only for chains is_better could never prefer. Below v6 that
+        # is a STRICTLY shorter chain (an equal-length one can still win the
+        # deterministic lower-tip-hash tie-break, so it must reach is_better --
+        # dropping it here is what made a pushed equal-length reorg silently fail
+        # while a pull would have adopted it). Above v6 a shorter chain can be
+        # heavier, so we never fast-reject on length there.
+        if not both_past_v6 and cand_len < cur_len:
+            return "kept"                     # pre-v6: strictly shorter can't win
     if not (cand.chain and cand.chain[0].compute_hash() == _CANONICAL_GENESIS_HASH):
         return "invalid"
     # Incremental validation. The overwhelming common case is a miner pushing
@@ -2919,6 +3043,9 @@ def handle_submit_chain(node, data):
         prev = cand.chain[cur_len - 1]
         for blk in cand.chain[cur_len:]:
             if blk.previous_hash != prev.compute_hash():
+                return "invalid"
+            # v6: pushed blocks obey the same median-time-past rule as mined ones
+            if not timestamp_ok(cand.chain, blk):
                 return "invalid"
             prev = blk
     else:
@@ -4266,9 +4393,9 @@ def start_mining(node):
     threading.Thread(target=mining_loop, args=(node,), daemon=True).start()
     add_event(node, "mining started")
     return ("mining started in the background (real proof-of-work; CPU works hard).\n"
-            "   Difficulty auto-adjusts: ~10s/block, ~100 SOSA/hour NETWORK-WIDE,\n"
+            "   Difficulty auto-adjusts: ~60s/block, ~100 SOSA/hour NETWORK-WIDE,\n"
             "   every active miner earning a slice of every block by proven work.\n"
-            "   Type 'stop' to stop. Transfers never wait for blocks.")
+            "   Type 'stop' to stop. Transfers settle in the next block or two.")
 
 
 def stop_mining(node):
