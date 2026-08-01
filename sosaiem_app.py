@@ -38,6 +38,9 @@ def start_node_network(node):
     # failed gossip (busy seed, momentary disconnect) can't silently strand a
     # send that the app already reported as "sent".
     threading.Thread(target=core.rebroadcast_transfers, args=(node,), daemon=True).start()
+    # Watchdog: detect when we've drifted onto a losing chain and force a resync,
+    # so a miner can't quietly waste work on a fork the network will reject.
+    threading.Thread(target=core.mining_watchdog, args=(node,), daemon=True).start()
     # Become a REACHABLE node: ask the router to forward our port (UPnP) and
     # confirm with a peer, so other people can join the network THROUGH this app.
     # Every app that succeeds is one less reason the network needs the founder's

@@ -139,7 +139,7 @@ ACTIVE_VALIDATOR_WINDOW = 15 * 60
 # window, faster syncing, bug fixes that only tighten what was already invalid.
 # Nobody has to agree on it and nothing can split over it.
 PROTOCOL_VERSION = 4
-NODE_VERSION = "2.17.0"    # v6 (ACTIVE since height 11750): work-based fork choice + median-time-past timestamps. Always-on: push-delivery fix, verified-cache eviction, submit_chain/is_better alignment, /network endpoint restored.
+NODE_VERSION = "3.0.0"    # Sosaiem 3.0: unified app, honest sync + mining watchdog (auto-recover from fork drift), transfer rebroadcast, balance de-dup fix, fair-work payout (flag day 15555). v6 fork choice active since 11750.
 
 # Blocks may carry a small tag naming the build that made them. It is accepted
 # and recorded, never required. A rule that forces everyone onto a particular
@@ -2492,6 +2492,8 @@ def make_handler(node):
                                 "last_hash": node.chain.last_block.compute_hash(),
                                 "protocol": PROTOCOL_VERSION,
                                 "version": NODE_VERSION,
+                                "synced": bool(getattr(node, "has_synced", False)),
+                                "watchdog_resyncs": getattr(node, "watchdog_resyncs", 0),
                                 "genesis": _CANONICAL_GENESIS_HASH})
             elif self.path == "/schain_tip":
                 # The share-chain's current tip, so a peer can tell whether it is
@@ -4798,6 +4800,58 @@ def _mine_one_block_racing(node):
             return won
 
 
+def mining_watchdog(node):
+    """
+    Catch the "mining on an invalid chain without noticing" failure.
+
+    The mining loop only reacts to our LOCAL tip moving; it trusts the background
+    sync to have already pulled any better network chain. But on a flaky link (a
+    throttled seed timing out, peers behind home routers) that sync can quietly
+    fail for minutes -- so the miner keeps extending its own island, the node
+    still reports "synced", and every block it wins is orphaned the moment it
+    finally reconnects. Users saw this as "mine for a while, then lose everything
+    on resync."
+
+    This watchdog runs independently: every ~15s it asks peers directly for their
+    height, and if ANY peer reports a chain meaningfully ahead of ours that we
+    have NOT adopted, it (a) marks us not-synced so the UI stops claiming we're
+    fine and mining pauses, and (b) forces a fresh chain pull. It never trusts a
+    single local read -- it goes and asks the network.
+    """
+    if getattr(node, "seed_only", False):
+        return
+    while True:
+        time.sleep(15)
+        try:
+            peers = list(node.peers)
+            if not peers:
+                continue
+            with node.lock:
+                mine = len(node.chain.chain)
+            best_seen = 0
+            for p in peers[:6]:
+                info = get_json(p.rstrip("/") + "/info", timeout=4)
+                if info and isinstance(info.get("blocks"), int):
+                    best_seen = max(best_seen, info["blocks"])
+            # A peer is clearly ahead of us and we haven't caught up. We might be
+            # on a private/losing fork. Stop trusting our own tip: mark unsynced
+            # (pauses mining, stops the UI claiming all's well) and force a pull.
+            if best_seen and best_seen > mine + 2:
+                node.has_synced = False
+                node.watchdog_resyncs = getattr(node, "watchdog_resyncs", 0) + 1
+                add_event(node, f"network is ahead ({best_seen} vs {mine}) -- resyncing")
+                try:
+                    sync_chain(node)
+                except Exception:
+                    pass
+                # if after the pull we're caught up, we're healthy again
+                with node.lock:
+                    if len(node.chain.chain) >= best_seen - 2:
+                        node.has_synced = True
+        except Exception:
+            pass
+
+
 def mining_loop(node):
     node.mine_stats = {"start": time.time(), "earned": 0.0, "blocks": 0}
     last_tick = time.time()
@@ -5004,6 +5058,7 @@ def main():
     start_server(node)
     threading.Thread(target=auto_sync_loop, args=(node,), daemon=True).start()
     threading.Thread(target=rebroadcast_transfers, args=(node,), daemon=True).start()
+    threading.Thread(target=mining_watchdog, args=(node,), daemon=True).start()
     if "--isolated" not in sys.argv:      # test mode: no LAN discovery -> stays sealed off
         threading.Thread(target=discovery_beacon, args=(node,), daemon=True).start()
         threading.Thread(target=discovery_listener, args=(node,), daemon=True).start()
