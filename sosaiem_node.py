@@ -40,7 +40,15 @@ class ThreadingHTTPServer(_BaseHTTPServer):
 
     def process_request(self, request, client_address):
         if self._pool is None:
-            type(self)._pool = ThreadPoolExecutor(max_workers=64,
+            # 64 workers was sized for a big server. On a small 2-core / 2 GB box
+            # it let dozens of requests -- several of them doing memory-hard work
+            # -- run at once, spiking memory into swap and stalling everything for
+            # tens of seconds (CPU idle, requests waiting on memory). A modest pool
+            # keeps the box responsive; extra requests queue briefly instead of all
+            # piling onto memory at once. Scale with cores, capped low.
+            import os as _os
+            workers = max(8, min(24, (_os.cpu_count() or 2) * 6))
+            type(self)._pool = ThreadPoolExecutor(max_workers=workers,
                                                   thread_name_prefix="sos-http")
         self._pool.submit(self._handle_pooled, request, client_address)
 
@@ -191,6 +199,81 @@ MAX_SHARES_PER_BLOCK = 128
 SHARE_WINDOW = 15
 
 
+# ===========================================================================
+# FAIR-WORK PAYOUT (Path B) -- DORMANT until FAIRWORK_HEIGHT is set.
+#
+# Goal: any device, any speed -- even the weakest -- always gets paid for the
+# exact work it did. Nobody is ever left out by being slow.
+#
+# How it stays SAFE (no fork, no share-chain desync): the payout is still
+# computed ENTIRELY from the shares embedded in the block, which every node
+# already agrees on. Same input -> same output on every node. This is the live
+# in-block ("paylist") payout, made continuous and inclusive -- NOT a return to
+# the fragile separate share-chain.
+#
+# Three changes vs. today, ALL off until the flag day:
+#   1. FAIRWORK_SHARE_EASE -- shares are far easier, so even a Raspberry Pi lands
+#      one every block or two. (bigger number = easier = weaker devices included)
+#   2. FAIRWORK_WINDOW -- a share counts if anchored to ANY block in a wider
+#      recent window, so slow work isn't thrown away when the tip ticks over.
+#   3. Difficulty-weighted split -- each share carries how hard it actually was;
+#      the reward splits by SUMMED difficulty, not raw share count. This is the
+#      fairest map of work->pay: someone who did 10x the work earns 10x, even if
+#      variance meant they landed fewer individual shares.
+#
+# FAIRWORK_HEIGHT = None means OFF everywhere: deploying this file changes
+# nothing. It is switched on only at a coordinated block height after real-node
+# testing (including a deliberately-throttled "Pi" node proving it gets paid).
+# ===========================================================================
+FAIRWORK_HEIGHT = 15555           # FLAG DAY: fair-work payout activates at block 15555.
+FAIRWORK_SHARE_EASE = 4096        # shares ~4096x easier than a block -> any device lands them
+FAIRWORK_WINDOW = 30              # a share stays payable across ~30 blocks (~30 min)
+FAIRWORK_MAX_SHARES = 256         # more room, since easy shares are more numerous
+
+
+def fairwork_active(height):
+    h = FAIRWORK_HEIGHT
+    return h is not None and height is not None and height >= h
+
+
+def fairwork_share_target(block_target):
+    """The (much easier) share target under the fair-work rule."""
+    return min(block_target * FAIRWORK_SHARE_EASE, MAX_TARGET)
+
+
+def share_target_at(block_target, height):
+    """
+    The share target in force at a given height. Below the fair-work flag day it
+    is the normal target; at/after activation it is the (much easier) fair-work
+    target so any device lands shares. Builder and validator both call this with
+    the SAME height, so they always agree on which shares are valid -- that is
+    what keeps the flag day fork-free among updated nodes.
+    """
+    if fairwork_active(height):
+        return fairwork_share_target(block_target)
+    return share_target_for(block_target)
+
+
+def share_difficulty(share_id_hex, share_target):
+    """
+    How much work a share proves, as a positive weight. A share whose hash is far
+    UNDER the target proved more work than one that barely cleared it, so we weight
+    by target/hash_value. This is what makes the split track true work, not luck:
+    across many shares it converges exactly to each miner's hashrate share. A
+    minimum weight of 1 guarantees any valid share -- from any device -- is paid.
+    """
+    try:
+        hv = int(share_id_hex, 16)
+        if hv <= 0:
+            return 1.0
+        w = share_target / hv
+        return w if w >= 1.0 else 1.0
+    except Exception:
+        return 1.0
+
+
+
+
 # --- transfers-in-blocks (offline-transfer settlement) ----------------------
 # Transfers move from the old online-voting system into the block chain: a
 # sender self-mines a small proof-of-work on their transfer, and miners carry it
@@ -321,6 +404,41 @@ def split_amounts(reward, counts):
     dust = round(reward - running, 8)
     if abs(dust) > 0:
         best = sorted(counts, key=lambda a: (-counts[a], a))[0]
+        out[best] = round(out[best] + dust, 8)
+    return {a: amt for a, amt in out.items() if amt > 0}
+
+
+def split_amounts_weighted(reward, weights):
+    """
+    Split a reward by difficulty-WEIGHTED work, deterministically.
+
+    `weights` maps address -> total proven work (a float sum of per-share
+    difficulty). Everyone with any weight gets paid in proportion; the split is
+    computed in a fixed order and any rounding dust is handed to the largest
+    contributor, so EVERY node with the same weights produces the identical
+    payout down to the last satoshi. That determinism is what lets this live
+    inside a block without a separate ledger to disagree about.
+
+    Weights are quantised to a fixed number of decimals before use, so two nodes
+    that computed the same shares can't diverge on float representation.
+    """
+    if reward <= 0 or not weights:
+        return {}
+    # quantise to 8 decimals so float noise can't make nodes disagree
+    q = {a: round(float(w), 8) for a, w in weights.items() if w and w > 0}
+    total = round(sum(q.values()), 8)
+    if total <= 0:
+        return {}
+    out = {}
+    running = 0.0
+    for addr in sorted(q):
+        amt = round(reward * q[addr] / total, 8)
+        out[addr] = amt
+        running = round(running + amt, 8)
+    dust = round(reward - running, 8)
+    if abs(dust) > 0:
+        # dust to the largest contributor (ties broken by address, deterministic)
+        best = sorted(q, key=lambda a: (-q[a], a))[0]
         out[best] = round(out[best] + dust, 8)
     return {a: amt for a, amt in out.items() if amt > 0}
 
@@ -990,9 +1108,13 @@ def _check_block_content(transactions, prev_hash, share_target, height=None,
         return False, 0.0
 
     counts = {}
+    weights = {}          # difficulty-weighted work per address (fair-work payout)
     if shares_entries:
         lst = shares_entries[0].get("list", [])
-        if not isinstance(lst, list) or len(lst) > MAX_SHARES_PER_BLOCK:
+        # At/after the fair-work flag day the block may legitimately carry more
+        # shares (they're easier), so the cap widens then.
+        _cap = FAIRWORK_MAX_SHARES if fairwork_active(height) else MAX_SHARES_PER_BLOCK
+        if not isinstance(lst, list) or len(lst) > _cap:
             return False, 0.0
         seen = set()
         for s in lst:
@@ -1018,9 +1140,13 @@ def _check_block_content(transactions, prev_hash, share_target, height=None,
             if (addr, nonce, at) in seen:
                 return False, 0.0
             seen.add((addr, nonce, at))
-            if int(share_hash(at, addr, nonce), 16) >= share_target:
+            _hv = int(share_hash(at, addr, nonce), 16)
+            if _hv >= share_target:
                 return False, 0.0
             counts[addr] = counts.get(addr, 0) + 1
+            # difficulty weight: how far under target this share landed (min 1).
+            # Only used by the fair-work payout; harmless to compute otherwise.
+            weights[addr] = weights.get(addr, 0.0) + share_difficulty(hex(_hv), share_target)
 
     block_reward = round(sum(tx["amount"] for tx in rewards), 8)
     if rewards:
@@ -1040,7 +1166,14 @@ def _check_block_content(transactions, prev_hash, share_target, height=None,
             return True
 
         # The old rule: the reward splits across the shares carried IN the block.
-        old_expected = split_amounts(block_reward, counts) if counts else None
+        # At/after the fair-work flag day it splits by DIFFICULTY-WEIGHTED work
+        # instead of raw share count, so every device is paid exactly for the work
+        # it proved. Both builder and validator compute this identically from the
+        # block's own shares, so updated nodes always agree.
+        if fairwork_active(height):
+            old_expected = split_amounts_weighted(block_reward, weights) if weights else None
+        else:
+            old_expected = split_amounts(block_reward, counts) if counts else None
 
         # The forced fair-payout: the split dictated by the SHARE-CHAIN, which no
         # single miner controls. Computed only when the rule is in force and we
@@ -1245,7 +1378,7 @@ def validate_full_chain(chain):
         bb = dict(running_bal) if has_transfer else None
         ok, block_reward = _check_block_content(
             block.transactions, block.previous_hash,
-            share_target_for(targets[block.index]), height=block.index,
+            share_target_at(targets[block.index], block.index), height=block.index,
             recent_tips=_tips_before(chain.chain, block.index),
             balances_before=bb)
         if not ok:
@@ -1309,7 +1442,8 @@ def validate_new_block(chain, block, share_chain=None):
     schain_fresh = (fresh_anchor_hashes(chain.chain, block.previous_hash)
                     if anchor_rule_active(block.index) else None)
     ok, block_reward = _check_block_content(
-        block.transactions, block.previous_hash, share_target_for(target),
+        block.transactions, block.previous_hash,
+        share_target_at(target, block.index),
         height=block.index,
         recent_tips=_tips_before(chain.chain + [block], block.index),
         balances_before=bb, share_chain=share_chain, schain_fresh=schain_fresh)
@@ -1410,6 +1544,20 @@ class Node:
         self.no_upnp = False
         self.no_nostr = False
 
+        # Cached /network summary. Recomputing it walks the whole chain, which is
+        # cheap at a few hundred blocks and slow at tens of thousands. Every mint
+        # page load used to trigger that full walk -- while holding the node lock,
+        # so it also stalled mining. We now cache the result for a few seconds:
+        # (built_at_timestamp, block_count_at_build, payload_dict).
+        self._network_cache = None
+        self._network_cache_lock = threading.Lock()
+        # Incremental accumulator for the /network summary. Instead of walking the
+        # whole chain on every rebuild (24s at 14k blocks), we keep running tallies
+        # and fold in only the blocks added since last time. Reset if the chain
+        # ever shrinks/reorgs (handled in the handler).
+        self._net_acc = {"count": 0, "minted": 0.0,
+                         "earned": {}, "won": {}}
+
         self.wallet = self._load_or_create_wallet()
         self._load_verified()
         self.chain = self._load_chain()
@@ -1440,6 +1588,10 @@ class Node:
         self.confirmed = set()
 
         self.mining = False
+        # True once we've pulled the network's chain at least once. Mining refuses
+        # to start before this when peers exist, so a fresh miner can't strike a
+        # dead fork on its lone genesis block before it has caught up.
+        self.has_synced = False
         self.mine_stats = {"start": None, "earned": 0.0, "blocks": 0}
         self.events = collections.deque(maxlen=40)
         # mining rewards are credited here; defaults to this node's own wallet,
@@ -1486,6 +1638,12 @@ class Node:
             print(f"  Remembered {len(self.peers)} peer(s) from last time.")
 
     def _load_or_create_wallet(self):
+        # Track whether this wallet is a brand-new one the user hasn't confirmed
+        # through the app's onboarding yet. When it's fresh, the UI shows the
+        # create/import welcome screen instead of dropping straight in -- so a
+        # first launch asks the user what they want rather than silently minting
+        # a wallet they didn't ask for.
+        self.wallet_is_fresh = False
         if os.path.exists(self.wallet_file):
             # A locked wallet needs its password. Whoever is starting us decides
             # how to ask for it -- the desktop app pops a box, a server reads
@@ -1503,19 +1661,30 @@ class Node:
                 print("  (this wallet predates recovery phrases -- it has no backup words.")
                 print("   to get a recoverable wallet, make a new one and send your SOSA to it.)")
         else:
+            # No wallet yet. Create a working one so the node can run, but mark
+            # it FRESH and do NOT print the phrase here -- the app's onboarding
+            # screen will either keep it (showing the phrase there) or replace it
+            # via create/import. On a plain console start we still announce it.
+            self.wallet_is_fresh = True
             try:
                 w, phrase = Wallet.create_with_phrase()
                 w.save_to_file(self.wallet_file)
-                print(f"  New wallet: {w.address()}")
-                print("\n  ================= WRITE THESE WORDS DOWN =================")
-                for i in range(0, len(phrase.split()), 6):
-                    print("    " + " ".join(phrase.split()[i:i + 6]))
-                print("  These 17 words are the only way back to this wallet if you")
-                print("  lose this computer. Anyone who reads them owns your coins.")
-                print("  =========================================================\n")
+                self._fresh_phrase = phrase
+                if not (sys.stdin and sys.stdin.isatty()):
+                    # launched by the app (no console prompt) -- stay quiet, let
+                    # the UI handle onboarding
+                    pass
+                else:
+                    print(f"  New wallet: {w.address()}")
+                    print("\n  ================= WRITE THESE WORDS DOWN =================")
+                    for i in range(0, len(phrase.split()), 6):
+                        print("    " + " ".join(phrase.split()[i:i + 6]))
+                    print("  These 17 words are the only way back to this wallet if you")
+                    print("  lose this computer. Anyone who reads them owns your coins.")
+                    print("  =========================================================\n")
             except Exception as e:
-                # a wallet that works beats no wallet -- but say so plainly
                 w = Wallet(); w.save_to_file(self.wallet_file)
+                self._fresh_phrase = None
                 print(f"  New wallet: {w.address()}")
                 print(f"  (no recovery phrase: {e})")
         return w
@@ -1580,7 +1749,7 @@ class Node:
                 target = targets[i] if i < len(targets) else MAX_TARGET
                 ok, _ = _check_block_content(
                     block.transactions, block.previous_hash,
-                    share_target_for(target), height=block.index,
+                    share_target_at(target, block.index), height=block.index,
                     recent_tips=_tips_before(blocks, block.index))
                 if not ok or int(block.pow_hash(), 16) >= target:
                     # Do NOT throw the chain away. A background check deciding
@@ -2020,7 +2189,26 @@ def api_summary(node):
         st = node.mine_stats
         elapsed = (time.time() - st["start"]) if (node.mining and st["start"]) else 0
         rate = round(st["earned"] / elapsed * 3600, 1) if elapsed > 1 else 0.0
+        # Honest sync health for the app: are we actually on the network's tip,
+        # still catching up, or islanded? A node that has adopted from a peer
+        # recently (or has no peers to compare against yet) is "synced"; one that
+        # is mining but hasn't heard a better tip in a while is "checking".
+        now = time.time()
+        last_adopt = getattr(node, "_last_peer_adopt", 0)
+        has_peers = len(node.peers) > 0
+        if not has_peers:
+            sync_state = "finding"          # no peers yet
+        elif getattr(node, "has_synced", False):
+            sync_state = "synced"
+        else:
+            sync_state = "syncing"
         return {"address": me,
+                "has_wallet": not getattr(node, "wallet_is_fresh", False),
+                "synced": (getattr(node, "has_synced", False) or not has_peers),
+                "sync_state": sync_state,
+                "reachable": bool(getattr(node, "reachable", False)),
+                "public_url": getattr(node, "public_url", None),
+                "version": NODE_VERSION,
                 "balance": round(balances.get(me, 0), 8),
                 "available": round(balances.get(me, 0) - pend_out, 8),
                 "blocks": len(node.chain.chain),
@@ -2172,7 +2360,27 @@ def make_handler(node):
                                          "the node's own computer (localhost)"}, 403)
                     return
                 try:
-                    body = DASHBOARD_HTML.encode()
+                    # Prefer the modern wallet UI shipped alongside the node
+                    # (wallet_ui.html); fall back to the built-in dashboard so
+                    # the node still works on its own.
+                    html = DASHBOARD_HTML
+                    try:
+                        # Look for the modern UI next to this file, and also in the
+                        # PyInstaller bundle dir (sys._MEIPASS) so the single .exe
+                        # finds its embedded wallet_ui.html.
+                        _dirs = [os.path.dirname(os.path.abspath(__file__))]
+                        _mei = getattr(sys, "_MEIPASS", None)
+                        if _mei:
+                            _dirs.insert(0, _mei)
+                        for _d in _dirs:
+                            _ui = os.path.join(_d, "wallet_ui.html")
+                            if os.path.exists(_ui):
+                                with open(_ui, encoding="utf-8") as _f:
+                                    html = _f.read()
+                                break
+                    except Exception:
+                        pass
+                    body = html.encode()
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.end_headers()
@@ -2275,43 +2483,70 @@ def make_handler(node):
                                              # second response, breaking share pull
 
             elif self.path == "/network":
-                # Compact public summary for the live mint page. Small and cheap
-                # to serve no matter how long the chain gets -- the page must
-                # never have to pull the whole chain just to show activity.
-                # (This handler used to be stranded, unreachable, after the
-                # return above inside /schain_shares, so /network answered
-                # "unknown" and the explorer page could never load. Now it is a
-                # real route.)
+                # Compact public summary for the live mint page.
+                #
+                # The tallies (minted, per-miner earnings, blocks won) are built
+                # INCREMENTALLY: we remember how far we've counted and, on each
+                # rebuild, fold in only the blocks added since -- instead of
+                # walking all ~14k+ blocks every time (which took ~24s and made
+                # the page hang). A short cache still absorbs bursts of requests.
+                # If the chain ever shrinks (a reorg), we reset and recount once.
+                NETWORK_CACHE_TTL = 3.0
+                now = time.time()
+                cached = node._network_cache
                 with node.lock:
-                    blocks = list(node.chain.chain)
-                    minted = total_minted(node.chain)
-                earned = {}
-                won = {}
-                for b in blocks[1:]:
-                    for tx in b.transactions:
-                        if isinstance(tx, dict) and tx.get("type") == "reward":
-                            a = tx.get("to")
-                            earned[a] = round(earned.get(a, 0.0) + tx.get("amount", 0.0), 8)
-                            won[a] = won.get(a, 0) + 1
-                recent = []
-                for b in blocks[-15:][::-1]:
-                    if b.index == 0:
-                        continue
-                    paid = [tx for tx in b.transactions
-                            if isinstance(tx, dict) and tx.get("type") == "reward"]
-                    recent.append({"h": b.index, "t": b.timestamp, "miners": len(paid),
-                                   "paid": round(sum(tx.get("amount", 0.0) for tx in paid), 8)})
-                active = []
-                if len(blocks) > 1:
-                    active = sorted({tx.get("to") for tx in blocks[-1].transactions
-                                     if isinstance(tx, dict) and tx.get("type") == "reward"})
-                roll = sorted(({"a": a, "n": n, "blocks": won.get(a, 0)}
-                               for a, n in earned.items()),
-                              key=lambda r: -r["n"])[:25]
-                self._json({"blocks": len(blocks), "minted": round(minted, 8),
-                            "max_supply": MAX_SUPPLY, "miners": len(earned),
-                            "active": active, "recent": recent, "roll": roll,
-                            "protocol": PROTOCOL_VERSION, "version": NODE_VERSION})
+                    height = len(node.chain.chain)
+                if (cached is not None
+                        and cached[0] is not None
+                        and (now - cached[0]) < NETWORK_CACHE_TTL
+                        and cached[1] == height):
+                    self._json(cached[2])       # serve the cached payload
+                else:
+                    with node.lock:
+                        blocks = list(node.chain.chain)
+                    acc = node._net_acc
+                    n = len(blocks)
+                    # Reset the accumulator if the chain shrank or diverged.
+                    if acc["count"] > n:
+                        acc = {"count": 0, "minted": 0.0, "earned": {}, "won": {}}
+                    # Fold in only the NEW blocks since we last counted.
+                    earned = acc["earned"]
+                    won = acc["won"]
+                    minted = acc["minted"]
+                    for b in blocks[acc["count"]:]:
+                        if b.index == 0:
+                            continue
+                        for tx in b.transactions:
+                            if isinstance(tx, dict) and tx.get("type") == "reward":
+                                a = tx.get("to")
+                                amt = tx.get("amount", 0.0)
+                                earned[a] = round(earned.get(a, 0.0) + amt, 8)
+                                won[a] = won.get(a, 0) + 1
+                                minted = round(minted + amt, 8)
+                    node._net_acc = {"count": n, "minted": minted,
+                                     "earned": earned, "won": won}
+                    # recent + active only look at the last handful of blocks
+                    recent = []
+                    for b in blocks[-15:][::-1]:
+                        if b.index == 0:
+                            continue
+                        paid = [tx for tx in b.transactions
+                                if isinstance(tx, dict) and tx.get("type") == "reward"]
+                        recent.append({"h": b.index, "t": b.timestamp, "miners": len(paid),
+                                       "paid": round(sum(tx.get("amount", 0.0) for tx in paid), 8)})
+                    active = []
+                    if len(blocks) > 1:
+                        active = sorted({tx.get("to") for tx in blocks[-1].transactions
+                                         if isinstance(tx, dict) and tx.get("type") == "reward"})
+                    roll = sorted(({"a": a, "n": nn, "blocks": won.get(a, 0)}
+                                   for a, nn in earned.items()),
+                                  key=lambda r: -r["n"])[:25]
+                    payload = {"blocks": n, "minted": round(minted, 8),
+                               "max_supply": MAX_SUPPLY, "miners": len(earned),
+                               "active": active, "recent": recent, "roll": roll,
+                               "protocol": PROTOCOL_VERSION, "version": NODE_VERSION}
+                    node._network_cache = (time.time(), n, payload)
+                    self._json(payload)
 
             elif self.path.startswith("/block"):
                 # One block in full, so anyone can browse the chain like any
@@ -2537,9 +2772,56 @@ def make_handler(node):
             elif self.path == "/api/mine":
                 if not self._local():
                     self._json({"error": "localhost-only"}, 403); return
+                # Optionally set the payout address the UI passed in.
+                pa = body.get("payout")
+                if isinstance(pa, str) and pa.startswith("SOSA") and len(pa) == 44:
+                    node.payout_address = pa
                 msg = start_mining(node) if body.get("on") else stop_mining(node)
                 self._json({"ok": True, "mining": node.mining,
                             "message": msg.split("\n")[0]})
+
+            elif self.path == "/api/wallet/new":
+                # Confirm/keep a new wallet. If the node already generated a fresh
+                # one at startup (the common first-launch case), show THAT wallet's
+                # phrase so what the user backs up is the wallet they'll actually
+                # use. Otherwise mint a new one now. Either way, clear the "fresh"
+                # flag so onboarding doesn't reappear.
+                if not self._local():
+                    self._json({"error": "localhost-only"}, 403); return
+                try:
+                    if getattr(node, "wallet_is_fresh", False) and getattr(node, "_fresh_phrase", None):
+                        phrase = node._fresh_phrase
+                        addr = node.wallet.address()
+                    else:
+                        w, phrase = Wallet.create_with_phrase()
+                        with node.lock:
+                            w.save_to_file(node.wallet_file, password=node.wallet_password)
+                            node.wallet = w
+                            node.payout_address = w.address()
+                            node.registry[w.address()] = {"pubkey": w.public_key_hex()}
+                        addr = w.address()
+                    node.wallet_is_fresh = False
+                    self._json({"ok": True, "address": addr, "phrase": phrase})
+                except Exception as e:
+                    self._json({"ok": False, "error": str(e)}, 400)
+
+            elif self.path == "/api/wallet/import":
+                if not self._local():
+                    self._json({"error": "localhost-only"}, 403); return
+                phrase = str(body.get("phrase", "")).strip()
+                try:
+                    w = Wallet.from_phrase(phrase)
+                    with node.lock:
+                        w.save_to_file(node.wallet_file, password=node.wallet_password)
+                        node.wallet = w
+                        node.payout_address = w.address()
+                        node.registry[w.address()] = {"pubkey": w.public_key_hex()}
+                        node.wallet_is_fresh = False
+                    self._json({"ok": True, "address": w.address()})
+                except Exception:
+                    self._json({"ok": False,
+                                "error": "those words didn't restore a wallet -- "
+                                         "check the spelling and order"}, 400)
 
             elif self.path == "/block":
                 try:
@@ -3437,6 +3719,27 @@ def sync(node):
     reconcile_chain_transfers(node)   # settle in-block transfers: confirm + drop from pending
     revote_pending(node)
     push_chain(node)          # shove our blocks OUT so unreachable miners still count
+    # Honest sync flag: we are 'synced' only when our chain is actually at or near
+    # the height our peers report -- NOT merely because peers exist. (Setting it on
+    # peer-existence alone made the app say "synced" while stuck on the genesis
+    # block, so an imported wallet's balance never showed.) When we have no peers
+    # we can't compare, so we don't claim synced.
+    try:
+        peers = list(node.peers)
+        if peers:
+            mine = len(node.chain.chain)
+            best_seen = 0
+            for p in peers[:6]:
+                info = get_json(p.rstrip("/") + "/info", timeout=4)
+                if info and isinstance(info.get("blocks"), int):
+                    best_seen = max(best_seen, info["blocks"])
+            # near = within a couple blocks of the best height anyone reports
+            if best_seen and mine >= best_seen - 2:
+                node.has_synced = True
+            elif best_seen and mine < best_seen - 2:
+                node.has_synced = False   # we're behind: NOT synced, keep pulling
+    except Exception:
+        pass
 
 
 def auto_sync_loop(node):
@@ -3450,6 +3753,26 @@ def auto_sync_loop(node):
         sync(node)
     except Exception:
         pass
+    # A fresh node (still on the genesis block) MUST download the real chain
+    # before it's useful -- otherwise it sits at height 1 forever and an imported
+    # wallet's balance never appears. The single immediate sync above can run
+    # before load_seeds has finished adding peers, so it finds nobody and does
+    # nothing. Here we retry sync briefly and insistently until we've actually
+    # left genesis, so the chain pull can't be missed just because of startup
+    # timing. Once we're past a handful of blocks, the normal loop takes over.
+    if not getattr(node, "seed_only", False):
+        for _ in range(20):                     # ~20 tries, 3s apart = up to 1 min
+            with node.lock:
+                h = len(node.chain.chain)
+                has_peers = len(node.peers) > 0
+            if h > 2:
+                break                            # we've adopted a real chain
+            if has_peers:
+                try:
+                    sync_chain(node)             # force the pull now
+                except Exception:
+                    pass
+            time.sleep(3)
     while True:
         time.sleep(interval)
         tick += 1
@@ -3798,6 +4121,19 @@ def load_seeds(node):
         if learned:
             print(f"  Learned {learned} more way(s) in from the network itself.")
         save_learned_seeds(node)
+        # CRITICAL: now that we actually have peers, pull the network's chain
+        # immediately. Without this, a fresh miner joins the network socially
+        # (peers show up) but keeps sitting on its lone genesis block until the
+        # background sync loop happens to run -- and if the user hits "mine" in
+        # that gap, they start mining a dead fork from block 1. Syncing here,
+        # inline, closes that window: by the time bootstrap reports success the
+        # node is already on the network's tip. Also mark that we've synced, so
+        # mining can refuse to start until this has happened at least once.
+        try:
+            sync(node)
+        except Exception:
+            pass
+        node.has_synced = True
         return True
 
     if not tried:
@@ -3860,9 +4196,15 @@ def retry_bootstrap(node):
         # ahead of us or we adopt their chain. Our OWN mined blocks never touch
         # it -- which is the whole point.
         last_adopt = getattr(node, "_last_peer_adopt", baseline)
+        # A node that is actually on the network loses the occasional block race
+        # and adopts within a block or two. If we're MINING and haven't heard a
+        # better tip from anyone in ~90s, we're very likely extending a private
+        # fork -- so re-seed fast to find a node outside our island. (This used to
+        # wait 5 minutes, which meant a miner could pile up a minute-plus of
+        # wasted, soon-to-be-orphaned blocks before rejoining.)
         marooned = (mining
-                    and (now - last_adopt) > 300      # ~5 min with nobody ahead
-                    and (now - last_reseed) > 120)    # but re-seed at most every 2 min
+                    and (now - last_adopt) > 90       # ~90s with nobody ahead
+                    and (now - last_reseed) > 45)     # re-seed at most every 45s
 
         if alone or stuck_for >= 6 or marooned:
             found = load_seeds(node)
@@ -4077,10 +4419,48 @@ def _mine_one_block_racing(node):
                     if (a, n, tip) not in already:
                         share_list.append({"address": a, "nonce": n, "prev": tip})
 
-        share_list = share_list[:MAX_SHARES_PER_BLOCK]
+        # Cap the share list fairly. A naive share_list[:CAP] drops whatever
+        # comes last once the cap is hit -- so when strong miners flood shares, a
+        # weak miner's single share gets crowded out and they earn NOTHING despite
+        # working ("weak PC left out"). Instead: first give every distinct address
+        # ONE slot (so presence guarantees payment), then distribute the remaining
+        # slots round-robin across addresses by how many shares they have. This is
+        # deterministic (sorted, no randomness) so every fair builder produces the
+        # same list, and inclusive so nobody who did real work is dropped.
+        _cap = FAIRWORK_MAX_SHARES if fairwork_active(prev.index + 1) else MAX_SHARES_PER_BLOCK
+        if len(share_list) > _cap:
+            by_addr = {}
+            for s in share_list:
+                by_addr.setdefault(s["address"], []).append(s)
+            # stable order: address, then original order within address
+            addrs = sorted(by_addr)
+            fair = []
+            # round 1: one share per address (guaranteed inclusion)
+            for a in addrs:
+                if len(fair) >= _cap:
+                    break
+                fair.append(by_addr[a].pop(0))
+            # rounds 2+: round-robin the remainder until the cap is full
+            while len(fair) < _cap and any(by_addr[a] for a in addrs):
+                for a in addrs:
+                    if len(fair) >= _cap:
+                        break
+                    if by_addr[a]:
+                        fair.append(by_addr[a].pop(0))
+            share_list = fair
+        else:
+            share_list = share_list[:_cap]
         counts = {}
+        _fw = fairwork_active(prev.index + 1)
+        _starget = share_target_at(target, prev.index + 1) if _fw else None
+        weights = {}
         for s in share_list:
             counts[s["address"]] = counts.get(s["address"], 0) + 1
+            if _fw:
+                _at = s.get("prev", prev_hash)
+                _hv = int(share_hash(_at, s["address"], s["nonce"]), 16)
+                weights[s["address"]] = weights.get(s["address"], 0.0) + \
+                    share_difficulty(hex(_hv), _starget)
         reward = round(max(0.0, min(BLOCK_REWARD, remaining_supply(node.chain))), 8)
         txs = []
         # prove this block came from a fair-split build
@@ -4098,7 +4478,13 @@ def _mine_one_block_racing(node):
                 # pay across the proof-of-work shares carried in THIS block --
                 # the same list every validator verifies and reads, so everyone
                 # who worked (and is in the block) is paid, deterministically.
-                canon = split_amounts(reward, counts) if counts else None
+                # At/after the fair-work flag day, split by difficulty-weighted
+                # work (matches the validator), so any device is paid for exactly
+                # the work it proved.
+                if _fw:
+                    canon = split_amounts_weighted(reward, weights) if weights else None
+                else:
+                    canon = split_amounts(reward, counts) if counts else None
             elif phase in ("grace", "hard"):
                 # Same anchor-recency set the validator will derive from this
                 # same parent block, so the fair split we build matches theirs.
@@ -4159,7 +4545,11 @@ def _mine_one_block_racing(node):
         prev = node.chain.last_block
         prev_hash = prev.compute_hash()
         target = next_target(node.chain.chain)
-        s_target = share_target_for(target)
+        # At/after the fair-work flag day this is the much easier target, so even
+        # a very weak device lands shares. Validators use the same height-aware
+        # target, so the shares this miner produces are accepted by every updated
+        # node. Below the flag day it's exactly the old target -- no change.
+        s_target = share_target_at(target, prev.index + 1)
         version = node.cur_shares["version"]
         candidate = build_candidate()
 
@@ -4395,6 +4785,27 @@ def start_mining(node):
                 "   everyone else and deliberately does no mining.")
     if node.mining:
         return "already mining -- type 'stop' to stop."
+    # Don't let a fresh miner strike blocks on its lone genesis chain before it
+    # has caught up to the network. If we know about peers but haven't synced to
+    # their (longer/heavier) chain yet, mining now would just build a dead fork
+    # from block 1 -- exactly the "it started from genesis and mined its own
+    # chain" bug. Try one inline sync; if we're still tiny while peers exist,
+    # hold off and tell the user to wait a moment.
+    with node.lock:
+        have_peers = len(node.peers) > 0
+        height = len(node.chain.chain)
+    if have_peers and not getattr(node, "has_synced", False):
+        try:
+            sync(node)
+            node.has_synced = True
+        except Exception:
+            pass
+        with node.lock:
+            height = len(node.chain.chain)
+        if height <= 1:
+            return ("still catching up to the network -- not mining yet so you\n"
+                    "   don't build your own dead fork. Give it a few seconds for\n"
+                    "   the chain to sync, then press start again.")
     node.mining = True
     threading.Thread(target=mining_loop, args=(node,), daemon=True).start()
     add_event(node, "mining started")

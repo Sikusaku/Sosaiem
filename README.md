@@ -9,12 +9,40 @@ stake-voting/on-chain settlement moves it. One ledger, open to everyone.
 
 ## Run a node / mine
 
-1. Download `sosaiem.zip` from https://sosaiem.com and unzip it.
-2. Run a node:  `python sosaiem_node.py 7000`
-3. Once synced, type `mine` (or use the wallet's mine button).
-4. To make Windows executables, run `build_exe.bat`.
+### Easiest — the Sosaiem app (recommended)
 
-Requires Python 3. Dependencies are standard-library plus the bundled modules.
+1. Download **`Sosaiem.exe`** from https://sosaiem.com and run it.
+2. On first launch it asks you to **create a new wallet** (shows your 17-word
+   recovery phrase — write it down) or **import** an existing phrase.
+3. It syncs to the network, then you can mine, send, and browse the chain from
+   one window (Mine / Send / Explorer / Node). Running it makes you a full node.
+
+To build the exe yourself: unzip the source, run `build_app_exe.bat` →
+`dist\Sosaiem.exe`. Or run from source: `python sosaiem_app.py`.
+
+### From source (node only)
+
+1. Download the source and unzip it.
+2. Run a node:  `python sosaiem_node.py 7000`
+3. Once synced, type `mine` (or use the app's mine button).
+4. To make the classic Windows executables, run `build_exe.bat`.
+
+Requires Python 3. Dependencies are standard-library plus the bundled modules
+(`dilithium-py` and `cryptography` install automatically on first run).
+
+## Upcoming — fair-work payout (flag day at block 15555)
+
+Sosaiem is upgrading so that **any device — even a Raspberry Pi — always gets
+paid for exactly the work it does.** At block **15555** every updated node
+switches to a difficulty-weighted, in-block payout with far easier work-shares,
+so no miner is ever left out for being slow.
+
+**This is a scheduled hard fork.** Every node must be on this release before
+block 15555. Below that height the chain behaves exactly as v2.17.0, so updated
+and not-yet-updated nodes agree until the switch. After it, non-updated nodes
+will be on a minority chain and must update to rejoin (coins are safe — same
+history to the fork point). See `SOSAIEM-FAIR-PAYOUT-DESIGN.md` for the full
+design.
 
 ## Current release — v2.17.0
 

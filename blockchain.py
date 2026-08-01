@@ -29,17 +29,18 @@ POW_MAXMEM = 2147483646
 
 import threading as _threading
 
-# Each attempt allocates 8 MB, on purpose -- that is what keeps mining off
+# Each attempt allocates ~8 MB, on purpose -- that is what keeps mining off
 # custom chips. But N threads hashing at once need N x 8 MB, and a small server
-# will burn through its memory, start swapping, and stop answering anything.
-# This gate keeps the arithmetic honest without starving the miner: eight slots
-# is 64 MB at worst, which any machine that can run this can spare, while still
-# ruling out the unbounded case where a burst of verification takes the box down.
-# Enough room for a full mining crew plus the node's own verification work.
-# Each slot is 8 MB while held, so this is a ceiling of about 300 MB in the
-# worst case -- affordable on any machine that can mine, and still a hard limit
-# so a burst of verification can never take the whole box down.
-_HASH_SLOTS = _threading.Semaphore(36)
+# will burn through its memory, start swapping, and stop answering anything --
+# which is exactly what happened: with the gate set to 36, a burst of concurrent
+# verification/mining hashes could momentarily demand ~300 MB on a 2 GB box,
+# push it into swap, and make it stall for tens of seconds (CPU idle, but every
+# request waiting on memory). 8 slots = ~64 MB worst case, which any machine
+# that can run this can spare, while still ruling out the unbounded burst that
+# takes the box down. This is a MEMORY safety valve, not a consensus value --
+# it changes nothing about which blocks are valid, only how many hashes run at
+# once, so nodes with different settings still agree on the chain.
+_HASH_SLOTS = _threading.Semaphore(8)
 
 
 def memory_hard(data: bytes) -> str:
@@ -146,12 +147,70 @@ def _target_sequence(blocks, extra=0):
     return out
 
 
+# --- target caching --------------------------------------------------------
+# compute_targets/next_target used to rebuild the ENTIRE target history from
+# block 0 on every call -- and they are called on every block validation, every
+# share, every /network request and every background verify pass. On a chain of
+# tens of thousands of blocks that is ~50ms of pure CPU *per call*, many times a
+# second, which pins the processor and makes everything (including the mint page)
+# slow. The result is fully determined by the block timestamps and the targets
+# before it, so it is safe to memoise: we keep the computed sequence and only
+# recompute when the chain actually changed. A reorg changes the tip hash, which
+# we detect and invalidate on.
+_targets_cache = {"len": -1, "tip": None, "seq": None}
+_targets_lock = _threading.Lock()
+
+
+def _chain_signature(blocks):
+    if not blocks:
+        return (0, None)
+    return (len(blocks), blocks[-1].compute_hash())
+
+
 def compute_targets(blocks):
-    return _target_sequence(blocks, extra=0)
+    sig_len, sig_tip = _chain_signature(blocks)
+    with _targets_lock:
+        if _targets_cache["len"] == sig_len and _targets_cache["tip"] == sig_tip \
+                and _targets_cache["seq"] is not None:
+            return _targets_cache["seq"]
+    seq = _target_sequence(blocks, extra=0)
+    with _targets_lock:
+        _targets_cache["len"] = sig_len
+        _targets_cache["tip"] = sig_tip
+        _targets_cache["seq"] = seq
+    return seq
 
 
 def next_target(blocks):
-    return _target_sequence(blocks, extra=1)[-1]
+    # next_target = the target for a hypothetical block appended after the tip.
+    # Reuse the cached sequence for the existing chain, then compute just the one
+    # extra step, instead of rebuilding the whole history with extra=1.
+    #
+    # Empty chain: the very first block (genesis, index 0) is mined against
+    # MAX_TARGET -- _target_sequence's i==0 branch. This MUST stay MAX_TARGET, or
+    # genesis is mined against a different target, finds a different nonce, and
+    # gets a different hash -- a different genesis == a different, incompatible
+    # chain. (This is exactly what a wrong value here broke once.)
+    i = len(blocks)                            # index of the would-be new block
+    if i == 0:
+        return MAX_TARGET
+    base = compute_targets(blocks)             # cached
+    if i >= LWMA_HEIGHT:
+        return _lwma_at(blocks, i, base)
+    if i >= ADJUST_WINDOW + 2 and (i - 2) % ADJUST_WINDOW == 0:
+        span = 0.0
+        for j in range(i - ADJUST_WINDOW, i):
+            gap = blocks[j].timestamp - blocks[j - 1].timestamp
+            span += max(0.1, min(gap, GAP_CAP))
+        ratio = span / (ADJUST_WINDOW * TARGET_BLOCK_SECONDS * EXPECT)
+        ratio = max(0.25, min(4.0, ratio))
+        return max(1, min(int(base[-1] * ratio), MAX_TARGET))
+    # No retarget at this step: difficulty carries forward. For block index 1
+    # (i == 1) the sequence sets INITIAL_TARGET; below the first adjustment
+    # window it carries INITIAL_TARGET; otherwise it carries the tip's target.
+    if i < ADJUST_WINDOW + 2:
+        return INITIAL_TARGET
+    return base[-1]                            # carry the tip's target forward
 
 
 class Blockchain:

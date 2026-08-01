@@ -1,2 +1,3 @@
 https://api.sosaiem.com
 http://134.209.125.53:80
+http://43.248.10.93:7000

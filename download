@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller build output
+build/
+dist/
+*.spec
+
+# Runtime data — never commit these (they're per-node)
+wallet_*.pem
+chain_*.json
+peers_*.json
+*.log
+*.bak
+*.bak[0-9]

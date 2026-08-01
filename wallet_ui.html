@@ -1,0 +1,572 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sosaiem</title>
+<style>
+:root{
+  --plate:#0a1511; --panel:#0f201b; --panel2:#0c1a16; --raise:#132a23;
+  --gilt:#c6a24a; --gilt2:#e7cd86; --paper:#eaf0e8; --dim:#8fa398; --sage:#6f8a7c;
+  --line:#1d332b; --green:#69b08c; --red:#d07a6b; --shadow:rgba(0,0,0,.45);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  font-family:'Segoe UI',system-ui,sans-serif;
+  background:
+    radial-gradient(1200px 600px at 80% -10%, #14322680 0%, transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, #0e241c99 0%, transparent 55%),
+    var(--plate);
+  color:var(--paper); overflow:hidden;
+}
+button{font-family:inherit;cursor:pointer;border:none;outline:none}
+.mono{font-family:'Consolas','SF Mono',monospace}
+
+/* ---------- app frame: sidebar + content ---------- */
+#app{display:none;height:100vh}
+.shell{display:grid;grid-template-columns:210px 1fr;height:100vh}
+.side{
+  background:linear-gradient(180deg,#0d1c17,#0a1511);
+  border-right:1px solid var(--line);
+  display:flex;flex-direction:column;padding:22px 14px;
+}
+.brand{padding:6px 10px 20px}
+.brand h1{font-family:Georgia,serif;color:var(--gilt);font-size:22px;letter-spacing:1px}
+.brand small{color:var(--sage);font-style:italic;font-size:11px}
+.nav{display:flex;flex-direction:column;gap:4px;margin-top:6px}
+.nav button{
+  display:flex;align-items:center;gap:11px;
+  background:transparent;color:var(--dim);text-align:left;
+  padding:11px 12px;border-radius:10px;font-size:14px;font-weight:600;
+  transition:background .15s,color .15s;
+}
+.nav button .ic{width:18px;text-align:center;font-size:15px;opacity:.85}
+.nav button:hover{background:#12241e;color:var(--paper)}
+.nav button.on{background:#16302710;background:linear-gradient(90deg,#1a3a2e,#12241e);color:var(--gilt2)}
+.nav button.on{box-shadow:inset 2px 0 0 var(--gilt)}
+.side .foot{margin-top:auto;padding:10px;color:var(--sage);font-size:11px;line-height:1.5}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--red);margin-right:6px;vertical-align:middle}
+.dot.live{background:var(--green);box-shadow:0 0 8px var(--green)}
+
+.content{overflow-y:auto;padding:26px 30px}
+.content::-webkit-scrollbar{width:9px}
+.content::-webkit-scrollbar-thumb{background:#1d332b;border-radius:5px}
+
+/* balance header */
+.topbar{display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:22px}
+.topbar .lbl{color:var(--sage);font-size:11px;letter-spacing:1.5px}
+.bal{font-family:'Consolas',monospace;font-size:34px;color:var(--gilt2);font-weight:700;line-height:1}
+.bal .u{font-size:15px;color:var(--dim);margin-left:6px}
+.addr-chip{
+  background:var(--panel);border:1px solid var(--line);border-radius:20px;
+  padding:7px 12px;font-size:12px;color:var(--dim);display:flex;gap:8px;align-items:center;
+}
+.addr-chip button{background:transparent;color:var(--gilt);font-size:11px;font-weight:700}
+
+/* cards */
+.card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px;margin-bottom:16px;box-shadow:0 6px 20px -12px var(--shadow)}
+.card h3{font-family:Georgia,serif;color:var(--paper);font-size:16px;margin-bottom:4px}
+.card p.sub{color:var(--dim);font-size:12.5px;margin-bottom:14px;line-height:1.5}
+.page{display:none;animation:fade .25s ease}
+.page.on{display:block}
+@keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+
+/* stat strip */
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.stat{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:12px;text-align:center}
+.stat .k{color:var(--sage);font-size:10px;letter-spacing:1px}
+.stat .v{font-family:'Consolas',monospace;font-size:18px;color:var(--paper);margin-top:4px}
+
+/* buttons + inputs */
+.btn{background:linear-gradient(180deg,var(--gilt2),var(--gilt));color:#20180a;font-weight:800;
+  padding:13px 20px;border-radius:12px;font-size:14px;letter-spacing:.3px;width:100%;
+  transition:transform .08s,filter .15s;box-shadow:0 6px 18px -8px var(--gilt)}
+.btn:hover{filter:brightness(1.06)}
+.btn:active{transform:translateY(1px)}
+.btn.stop{background:linear-gradient(180deg,#e08979,var(--red));box-shadow:0 6px 18px -8px var(--red);color:#2a1712}
+.btn.ghost{background:transparent;border:1px solid var(--line);color:var(--paper);box-shadow:none;font-weight:600}
+.btn.ghost:hover{background:#14261f}
+label.f{display:block;color:var(--sage);font-size:11px;letter-spacing:1px;margin:12px 0 5px}
+input.f{width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:10px;
+  color:var(--paper);padding:12px;font-family:'Consolas',monospace;font-size:13px}
+input.f:focus{border-color:var(--gilt)}
+.msg{font-size:12.5px;margin-top:12px;min-height:16px}
+.msg.ok{color:var(--green)} .msg.err{color:var(--red)} .msg.dim{color:var(--dim)}
+
+/* feed + table */
+.feed{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:12px;
+  font-family:'Consolas',monospace;font-size:11.5px;color:var(--dim);height:190px;overflow-y:auto;line-height:1.7}
+.feed .hit{color:var(--gilt2)}
+table{width:100%;border-collapse:collapse;font-family:'Consolas',monospace;font-size:12px}
+th{color:var(--sage);font-size:10px;letter-spacing:1px;text-align:left;padding:8px 6px;border-bottom:1px solid var(--line)}
+td{padding:9px 6px;border-bottom:1px solid #14261f;color:var(--paper)}
+tr:hover td{background:#12241e}
+.pill{display:inline-block;background:#16302733;color:var(--green);border:1px solid #23483a;border-radius:20px;padding:2px 9px;font-size:11px}
+
+/* ---------- onboarding ---------- */
+#onboard{display:flex;align-items:center;justify-content:center;height:100vh;padding:24px}
+.ob{width:100%;max-width:440px}
+.ob .logo{text-align:center;margin-bottom:26px}
+.ob .logo h1{font-family:Georgia,serif;color:var(--gilt);font-size:40px;letter-spacing:2px}
+.ob .logo small{color:var(--sage);font-style:italic}
+.ob-card{background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:26px;box-shadow:0 20px 50px -24px #000}
+.ob-step{display:none} .ob-step.on{display:block;animation:fade .25s ease}
+.choice{display:flex;flex-direction:column;gap:12px;margin-top:6px}
+.choice .btn{padding:16px}
+.words{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:16px 0}
+.word{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:9px;font-family:'Consolas',monospace;font-size:13px;color:var(--gilt2);display:flex;gap:7px}
+.word i{color:var(--sage);font-style:normal;font-size:11px;min-width:16px}
+.warn{background:#2a1a1233;border:1px solid #4a2b23;border-radius:11px;padding:13px;color:#e6a08f;font-size:12.5px;line-height:1.55;margin:6px 0 4px}
+.warn b{color:#f0b6a4}
+textarea.f{width:100%;min-height:96px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;color:var(--paper);padding:12px;font-family:'Consolas',monospace;font-size:13px;resize:vertical}
+textarea.f:focus{border-color:var(--gilt)}
+.back{background:transparent;color:var(--dim);font-size:12px;margin-top:14px}
+.back:hover{color:var(--paper)}
+.chk{display:flex;gap:9px;align-items:flex-start;margin:12px 0;color:var(--dim);font-size:12.5px;cursor:pointer}
+.chk input{margin-top:2px;accent-color:var(--gilt)}
+
+/* explorer sub-tabs */
+.subtab{background:var(--panel2);color:var(--dim);border:1px solid var(--line);border-radius:9px;padding:7px 14px;font-size:12px;font-weight:600;transition:all .15s}
+.subtab:hover{color:var(--paper)}
+.subtab.on{background:linear-gradient(180deg,#1a3a2e,#12241e);color:var(--gilt2);border-color:#23483a}
+.sub{display:none} .sub.on{display:block;animation:fade .2s ease}
+td.click{cursor:pointer}
+tr.brow:hover td{background:#16302a}
+.me-row td{color:var(--gilt2)!important}
+
+/* block detail modal */
+#blockModal{display:none;position:fixed;inset:0;background:rgba(4,10,8,.7);z-index:50;align-items:center;justify-content:center;padding:24px;backdrop-filter:blur(3px)}
+#blockModal.on{display:flex;animation:fade .2s ease}
+.modal-card{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:22px;max-width:460px;width:100%;max-height:82vh;overflow-y:auto;box-shadow:0 30px 70px -20px #000}
+.kv{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid #14261f;font-size:12.5px}
+.kv .k{color:var(--sage)} .kv .v{color:var(--paper);font-family:'Consolas',monospace;text-align:right;word-break:break-all;max-width:65%}
+.paid-row{display:flex;justify-content:space-between;padding:6px 10px;background:var(--panel2);border-radius:8px;margin-top:6px;font-family:'Consolas',monospace;font-size:12px}
+.paid-row .a{color:var(--dim)} .paid-row .amt{color:var(--green)}
+.mini-h{color:var(--sage);font-size:10px;letter-spacing:1px;margin:16px 0 6px}
+.reach{border-radius:11px;padding:12px 14px;font-size:12.5px;line-height:1.5;border:1px solid var(--line);background:var(--panel2);color:var(--dim)}
+.reach.yes{border-color:#23483a;background:#16302a;color:var(--green)}
+.reach.no{border-color:#3a2b23;background:#241a12;color:#e0b48f}
+</style>
+</head>
+<body>
+
+<!-- ============ ONBOARDING ============ -->
+<div id="onboard">
+  <div class="ob">
+    <div class="logo"><h1>SOSAIEM</h1><small>society&rsquo;s coin &middot; owned by no one</small></div>
+    <div class="ob-card">
+
+      <!-- choose -->
+      <div class="ob-step on" id="ob-choose">
+        <h3 style="font-family:Georgia,serif;font-size:19px;margin-bottom:4px">Welcome</h3>
+        <p class="msg dim" style="margin:0 0 4px">Create a wallet to start, or bring an existing one back with your recovery words.</p>
+        <div class="choice">
+          <button class="btn" onclick="obNew()">Create a new wallet</button>
+          <button class="btn ghost" onclick="obShow('ob-import')">Import from recovery phrase</button>
+        </div>
+      </div>
+
+      <!-- show phrase -->
+      <div class="ob-step" id="ob-reveal">
+        <h3 style="font-family:Georgia,serif;font-size:19px">Your recovery phrase</h3>
+        <p class="msg dim" style="margin:2px 0 0">These 17 words are the only way back to this wallet.</p>
+        <div class="words" id="ob-words"></div>
+        <div class="warn"><b>Write them down and keep them offline.</b> Anyone who sees these words owns your coins. We can&rsquo;t reset them and no one can recover them for you.</div>
+        <label class="chk"><input type="checkbox" id="ob-ack"><span>I&rsquo;ve written my recovery phrase down somewhere safe.</span></label>
+        <button class="btn" onclick="obFinishNew()">Enter Sosaiem</button>
+        <button class="back" onclick="obShow('ob-choose')">&larr; back</button>
+      </div>
+
+      <!-- import -->
+      <div class="ob-step" id="ob-import">
+        <h3 style="font-family:Georgia,serif;font-size:19px">Import a wallet</h3>
+        <p class="msg dim" style="margin:2px 0 8px">Paste your 17-word recovery phrase, words separated by spaces.</p>
+        <textarea class="f" id="ob-phrase" placeholder="cove east fuse chain grove jewel ..."></textarea>
+        <div class="msg err" id="ob-import-msg"></div>
+        <button class="btn" onclick="obImport()">Restore wallet</button>
+        <button class="back" onclick="obShow('ob-choose')">&larr; back</button>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ============ MAIN APP ============ -->
+<div id="app">
+<div class="shell">
+  <aside class="side">
+    <div class="brand"><h1>SOSAIEM</h1><small>society&rsquo;s coin</small></div>
+    <nav class="nav">
+      <button class="on" data-p="mine" onclick="go('mine',this)"><span class="ic">&#9874;</span>Mine</button>
+      <button data-p="send" onclick="go('send',this)"><span class="ic">&#8599;</span>Send</button>
+      <button data-p="explorer" onclick="go('explorer',this)"><span class="ic">&#9638;</span>Explorer</button>
+      <button data-p="node" onclick="go('node',this)"><span class="ic">&#9737;</span>Node</button>
+    </nav>
+    <div class="foot"><span class="dot" id="netdot"></span><span id="netstate">connecting&hellip;</span><br>
+      <span id="ver" style="opacity:.6"></span></div>
+  </aside>
+
+  <main class="content">
+    <div class="topbar">
+      <div>
+        <div class="lbl">YOUR BALANCE</div>
+        <div class="bal"><span id="bal">&mdash;</span><span class="u">SOSA</span></div>
+      </div>
+      <div class="addr-chip"><span class="mono" id="addr-short">&mdash;</span><button onclick="copyAddr()">copy</button></div>
+    </div>
+
+    <!-- MINE -->
+    <section class="page on" id="page-mine">
+      <div class="card">
+        <h3>Strike coins</h3>
+        <p class="sub">Real proof-of-work. Every active miner earns a slice of every block, by the work they do &mdash; even a weak computer is always paid for what it contributes.</p>
+        <label class="f">PAYOUT ADDRESS</label>
+        <input class="f" id="payout" placeholder="SOSA...">
+        <div style="height:14px"></div>
+        <button class="btn" id="minebtn" onclick="toggleMine()">START MINING</button>
+        <div class="msg dim" id="minemsg">idle</div>
+      </div>
+      <div class="card">
+        <div class="stats">
+          <div class="stat"><div class="k">SESSION EARNED</div><div class="v" id="s-earned">0.000000</div></div>
+          <div class="stat"><div class="k">RATE</div><div class="v" id="s-rate">&mdash;</div></div>
+          <div class="stat"><div class="k">CHAIN HEIGHT</div><div class="v" id="s-height">&mdash;</div></div>
+          <div class="stat"><div class="k">PEERS</div><div class="v" id="s-peers">&mdash;</div></div>
+        </div>
+        <div style="height:14px"></div>
+        <div class="feed" id="feed">press start to mine&hellip;</div>
+      </div>
+    </section>
+
+    <!-- SEND -->
+    <section class="page" id="page-send">
+      <div class="card">
+        <h3>Send SOSA</h3>
+        <p class="sub">Feeless. Settles in the next block or two.</p>
+        <label class="f">TO ADDRESS</label>
+        <input class="f" id="to" placeholder="SOSA...">
+        <label class="f">AMOUNT</label>
+        <input class="f" id="amt" placeholder="0.00">
+        <div style="height:16px"></div>
+        <button class="btn" onclick="doSend()">SEND</button>
+        <div class="msg dim" id="sendmsg">feeless &middot; settles in the next block or two</div>
+      </div>
+    </section>
+
+    <!-- EXPLORER -->
+    <section class="page" id="page-explorer">
+      <div class="card">
+        <div style="display:flex;gap:8px;margin-bottom:14px">
+          <button class="subtab on" data-s="blocks" onclick="goSub('blocks',this)">Blocks</button>
+          <button class="subtab" data-s="holders" onclick="goSub('holders',this)">Holders</button>
+          <button class="subtab" data-s="transfers" onclick="goSub('transfers',this)">Transfers</button>
+        </div>
+
+        <!-- blocks list -->
+        <div class="sub on" id="sub-blocks">
+          <p class="sub" style="margin-bottom:10px">Newest blocks first. Click any block to see who worked and who got paid.</p>
+          <table>
+            <thead><tr><th>BLOCK</th><th>WHEN</th><th>MINERS</th><th>MINTED</th></tr></thead>
+            <tbody id="blocks"><tr><td colspan="4" style="color:var(--dim)">loading&hellip;</td></tr></tbody>
+          </table>
+        </div>
+
+        <!-- holders -->
+        <div class="sub" id="sub-holders">
+          <p class="sub" style="margin-bottom:10px">Every address holding SOSA, largest first.</p>
+          <table>
+            <thead><tr><th>#</th><th>ADDRESS</th><th>BALANCE</th><th>SHARE</th></tr></thead>
+            <tbody id="holders"><tr><td colspan="4" style="color:var(--dim)">loading&hellip;</td></tr></tbody>
+          </table>
+        </div>
+
+        <!-- transfers -->
+        <div class="sub" id="sub-transfers">
+          <p class="sub" style="margin-bottom:10px">Recent sends across the network.</p>
+          <table>
+            <thead><tr><th>FROM</th><th>TO</th><th>AMOUNT</th><th>WHEN</th></tr></thead>
+            <tbody id="transfers"><tr><td colspan="4" style="color:var(--dim)">loading&hellip;</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- block detail modal -->
+    <div id="blockModal" onclick="if(event.target===this)closeBlock()">
+      <div class="modal-card">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <h3 style="font-family:Georgia,serif;font-size:18px;color:var(--gilt2)" id="bm-title">Block</h3>
+          <button onclick="closeBlock()" style="background:transparent;color:var(--dim);font-size:20px">&times;</button>
+        </div>
+        <div id="bm-body" style="margin-top:12px"></div>
+      </div>
+    </div>
+
+    <!-- NODE -->
+    <section class="page" id="page-node">
+      <div class="card">
+        <h3>You are a node</h3>
+        <p class="sub">Running this app already helps hold the network up. No central server, no owner.</p>
+        <div id="reach-banner" class="reach">checking whether the network can reach you&hellip;</div>
+        <div class="stats" style="margin-top:14px">
+          <div class="stat"><div class="k">CHAIN HEIGHT</div><div class="v" id="n-height">&mdash;</div></div>
+          <div class="stat"><div class="k">KNOWN NODES</div><div class="v" id="n-peers">&mdash;</div></div>
+          <div class="stat"><div class="k">SYNCED</div><div class="v" id="n-synced">&mdash;</div></div>
+          <div class="stat"><div class="k">MINTED</div><div class="v" id="n-minted">&mdash;</div></div>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Known nodes</h3>
+        <p class="sub">The ways into the network this node currently knows.</p>
+        <div class="feed" id="nodelist">finding nodes&hellip;</div>
+      </div>
+    </section>
+  </main>
+</div>
+</div>
+
+<script>
+// ---- tiny API layer (talks to the local node) ----
+async function api(path, body){
+  const opt = body ? {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)} : {};
+  const r = await fetch(path, opt);
+  return r.json();
+}
+let ADDR = "", MINING = false, MINING_WANTED = false, pendingPhrase = null;
+
+// ---------- onboarding ----------
+function obShow(id){document.querySelectorAll('.ob-step').forEach(s=>s.classList.remove('on'));document.getElementById(id).classList.add('on');}
+async function obNew(){
+  const r = await api('/api/wallet/new', {});
+  if(!r || !r.phrase){ alert('could not create wallet'); return; }
+  pendingPhrase = r.phrase;
+  const words = r.phrase.split(/\s+/);
+  document.getElementById('ob-words').innerHTML =
+    words.map((w,i)=>`<div class="word"><i>${i+1}</i>${w}</div>`).join('');
+  document.getElementById('ob-ack').checked=false;
+  obShow('ob-reveal');
+}
+function obFinishNew(){
+  if(!document.getElementById('ob-ack').checked){
+    document.getElementById('ob-ack').parentElement.style.color='var(--red)'; return;
+  }
+  enterApp();
+}
+async function obImport(){
+  const phrase=document.getElementById('ob-phrase').value.trim();
+  const msg=document.getElementById('ob-import-msg');
+  if(phrase.split(/\s+/).length < 12){ msg.textContent='that doesn\u2019t look like a full recovery phrase.'; return; }
+  msg.textContent='restoring\u2026'; msg.className='msg dim';
+  const r=await api('/api/wallet/import',{phrase});
+  if(r && r.ok){ enterApp(); }
+  else { msg.className='msg err'; msg.textContent=(r&&r.error)||'could not restore from those words.'; }
+}
+function enterApp(){
+  document.getElementById('onboard').style.display='none';
+  document.getElementById('app').style.display='block';
+  tick(); setInterval(tick, 1500);
+}
+
+// ---------- navigation ----------
+function go(page, el){
+  document.querySelectorAll('.nav button').forEach(b=>b.classList.remove('on'));
+  el.classList.add('on');
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('on'));
+  document.getElementById('page-'+page).classList.add('on');
+}
+
+// ---------- actions ----------
+function copyAddr(){navigator.clipboard.writeText(ADDR);}
+async function toggleMine(){
+  const on = !MINING;
+  MINING_WANTED = on;
+  let payout = document.getElementById('payout').value.trim();
+  if(on && !(payout.startsWith('SOSA') && payout.length===44)){
+    setMsg('minemsg','that isn\u2019t a SOSA address','err'); MINING_WANTED=false; return;
+  }
+  const r = await api('/api/mine', {on, payout});
+  MINING = r.mining;
+  updateMineBtn();
+  if(on && !r.mining) setMsg('minemsg','catching up to the network first \u2014 mining will start automatically once synced','dim');
+}
+function updateMineBtn(){
+  const b=document.getElementById('minebtn');
+  if(MINING){b.textContent='STOP MINING';b.classList.add('stop');document.getElementById('payout').disabled=true;setMsg('minemsg','mining \u2014 rewards go to your address','ok');}
+  else{b.textContent='START MINING';b.classList.remove('stop');document.getElementById('payout').disabled=false;}
+}
+async function doSend(){
+  const to=document.getElementById('to').value.trim();
+  const amount=parseFloat(document.getElementById('amt').value);
+  if(isNaN(amount)){setMsg('sendmsg','enter a number for the amount','err');return;}
+  const r=await api('/api/send',{to,amount});
+  setMsg('sendmsg', r.message||'', r.ok?'ok':'err');
+  if(r.ok){document.getElementById('to').value='';document.getElementById('amt').value='';}
+}
+function setMsg(id,text,kind){const e=document.getElementById(id);e.textContent=text;e.className='msg '+(kind||'dim');}
+
+// ---------- live refresh ----------
+async function tick(){
+  let d; try{ d = await api('/api/summary'); }catch(e){ return; }
+  if(!d) return;
+  ADDR = d.address||'';
+  document.getElementById('bal').textContent = fmtSosa(d.balance||0);
+  document.getElementById('addr-short').textContent = ADDR ? ADDR.slice(0,10)+'\u2026'+ADDR.slice(-6) : '\u2014';
+  if(!document.getElementById('payout').value) document.getElementById('payout').value = ADDR;
+
+  MINING = d.mining;
+  document.getElementById('s-earned').textContent=(d.session_earned||0).toFixed(6);
+  document.getElementById('s-rate').textContent = d.mining?('~'+(d.rate||0)+'/hr'):'\u2014';
+  document.getElementById('s-height').textContent = d.blocks||'\u2014';
+  document.getElementById('s-peers').textContent = (d.peers||[]).length;
+  if((document.getElementById('minebtn').textContent==='STOP MINING')!==MINING) updateMineBtn();
+
+  const ev=(d.events||[]).slice().reverse();
+  document.getElementById('feed').innerHTML = ev.length
+    ? ev.map(e=>{const hit=/won block|struck|\+/.test(e);return `<div class="${hit?'hit':''}">${escapeHtml(e)}</div>`}).join('')
+    : 'press start to mine\u2026';
+
+  // node tab
+  document.getElementById('n-height').textContent=d.blocks||'\u2014';
+  document.getElementById('n-peers').textContent=(d.peers||[]).length;
+  document.getElementById('n-synced').textContent = d.synced===false?'syncing\u2026':'yes';
+  document.getElementById('n-minted').textContent=(d.minted||0).toLocaleString();
+  const rb=document.getElementById('reach-banner');
+  if(rb){
+    if(d.reachable){
+      rb.className='reach yes';
+      rb.innerHTML='\u2713 The network can reach you \u2014 you\u2019re a way in for newcomers, helping hold Sosaiem up.';
+    } else if(d.sync_state==='synced'){
+      rb.className='reach no';
+      rb.innerHTML='You\u2019re a full node, but the outside can\u2019t reach you yet (common on home routers). Mining and sending work fine. To also host newcomers, allow the app through your firewall or enable UPnP on your router.';
+    } else {
+      rb.className='reach';
+      rb.textContent='checking whether the network can reach you\u2026';
+    }
+  }
+  document.getElementById('nodelist').innerHTML = (d.peers&&d.peers.length)
+    ? d.peers.map(p=>escapeHtml(p.replace(/^https?:\/\//,''))).join('<br>')
+    : 'finding nodes\u2026';
+
+  // net status
+  const live=(d.peers||[]).length>0;
+  const ss = d.sync_state||'finding';
+  document.getElementById('netdot').className='dot'+(ss==='synced'?' live':'');
+  const stateText = ss==='synced' ? ('on the network \u00b7 '+(d.peers||[]).length+' peers')
+                   : ss==='syncing' ? 'syncing with the network\u2026'
+                   : 'searching for the network\u2026';
+  document.getElementById('netstate').textContent = stateText;
+  document.getElementById('ver').textContent = 'v'+(d.version||'');
+
+  // if mining was blocked because we're not synced, keep the message honest,
+  // and auto-start once we're synced so the user doesn't have to press again
+  if(MINING_WANTED && !MINING){
+    if(ss==='synced'){
+      const payout = document.getElementById('payout').value.trim();
+      const r = await api('/api/mine', {on:true, payout});
+      MINING = r.mining; updateMineBtn();
+    } else {
+      setMsg('minemsg','catching up to the network first \u2014 mining will start once synced','dim');
+    }
+  }
+
+  // explorer (from /network, richer than summary)
+  refreshBlocks();
+}
+let lastTip='';
+async function refreshBlocks(){
+  let n; try{ n = await api('/network'); }catch(e){ return; }
+  if(!n || !n.recent) return;
+  const tip = n.recent[0] ? n.recent[0].h : '';
+  if(tip===lastTip) return; lastTip=tip;
+  document.getElementById('blocks').innerHTML = n.recent.map(b=>{
+    const when=new Date((b.t||0)*1000).toLocaleTimeString();
+    return `<tr class="brow" onclick="openBlock(${b.h})"><td class="click" style="color:var(--gilt2)">${b.h}</td>
+      <td>${when}</td><td><span class="pill">${b.miners}</span></td><td>${fmtSosa(b.paid||0)}</td></tr>`;
+  }).join('');
+}
+
+// explorer sub-tabs
+function goSub(which, el){
+  document.querySelectorAll('.subtab').forEach(b=>b.classList.remove('on'));
+  el.classList.add('on');
+  document.querySelectorAll('.sub').forEach(s=>s.classList.remove('on'));
+  document.getElementById('sub-'+which).classList.add('on');
+  if(which==='holders') loadHolders();
+  if(which==='transfers') loadTransfers();
+}
+
+async function loadHolders(){
+  let d; try{ d = await api('/holders'); }catch(e){ return; }
+  const rows = (d && d.holders) || [];
+  document.getElementById('holders').innerHTML = rows.length ? rows.map((h,i)=>{
+    const mine = h.address===ADDR;
+    return `<tr class="${mine?'me-row':''}"><td>${i+1}</td>
+      <td style="color:var(--dim)">${h.address.slice(0,10)}\u2026${h.address.slice(-6)}${mine?' (you)':''}</td>
+      <td>${fmtSosa(h.balance)}</td><td>${(h.share||0).toFixed(2)}%</td></tr>`;
+  }).join('') : '<tr><td colspan="4" style="color:var(--dim)">no holders yet</td></tr>';
+}
+
+async function loadTransfers(){
+  let d; try{ d = await api('/transfers?limit=40'); }catch(e){ return; }
+  const rows = (d && d.confirmed) || [];
+  document.getElementById('transfers').innerHTML = rows.length ? rows.map(t=>{
+    const frm=(t.from||'?'), to=(t.to||'?');
+    const when = t.timestamp ? new Date(t.timestamp*1000).toLocaleString() : '\u2014';
+    return `<tr><td style="color:var(--dim)">${frm.slice(0,8)}\u2026</td>
+      <td style="color:var(--dim)">${to.slice(0,8)}\u2026</td>
+      <td style="color:var(--gilt2)">${fmtSosa(t.amount||0)}</td><td style="color:var(--dim)">${when}</td></tr>`;
+  }).join('') : '<tr><td colspan="4" style="color:var(--dim)">no transfers yet</td></tr>';
+}
+
+// block detail modal
+async function openBlock(h){
+  const modal=document.getElementById('blockModal');
+  document.getElementById('bm-title').textContent='Block '+h;
+  document.getElementById('bm-body').innerHTML='<p style="color:var(--dim)">loading\u2026</p>';
+  modal.classList.add('on');
+  let b; try{ b = await api('/block?h='+h); }catch(e){ document.getElementById('bm-body').innerHTML='<p style="color:var(--red)">could not load block</p>'; return; }
+  if(!b || b.error){ document.getElementById('bm-body').innerHTML='<p style="color:var(--red)">no such block</p>'; return; }
+  const when=new Date((b.timestamp||0)*1000).toLocaleString();
+  const paid=(b.paid||[]);
+  const totalPaid=paid.reduce((s,p)=>s+(p.amount||0),0);
+  document.getElementById('bm-body').innerHTML = `
+    <div class="kv"><span class="k">Struck</span><span class="v">${when}</span></div>
+    <div class="kv"><span class="k">Reward</span><span class="v">${fmtSosa(b.reward||0)} SOSA</span></div>
+    <div class="kv"><span class="k">Miners paid</span><span class="v">${paid.length}</span></div>
+    <div class="kv"><span class="k">Work shares</span><span class="v">${b.work_shares||0}</span></div>
+    <div class="kv"><span class="k">Difficulty</span><span class="v">${b.difficulty_bits||0} bits</span></div>
+    <div class="kv"><span class="k">Nonce</span><span class="v">${b.nonce}</span></div>
+    <div class="kv"><span class="k">Hash</span><span class="v">${(b.hash||'').slice(0,32)}\u2026</span></div>
+    <div class="mini-h">WHO GOT PAID</div>
+    ${paid.length ? paid.map(p=>{
+      const mine=p.to===ADDR;
+      return `<div class="paid-row"><span class="a">${p.to.slice(0,12)}\u2026${p.to.slice(-6)}${mine?' (you)':''}</span><span class="amt">+${fmtSosa(p.amount||0)}</span></div>`;
+    }).join('') : '<p style="color:var(--dim);font-size:12px">no payouts in this block</p>'}
+  `;
+}
+function closeBlock(){ document.getElementById('blockModal').classList.remove('on'); }
+function escapeHtml(s){return String(s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));}
+// Show SOSA at full precision (up to 8 decimals), with thousands separators,
+// trimming only trailing zeros so 1048.52124857 shows in full but 5.5 stays 5.5.
+function fmtSosa(n){
+  n = Number(n)||0;
+  let s = n.toFixed(8).replace(/0+$/,'').replace(/\.$/,'');
+  let [whole, frac] = s.split('.');
+  whole = Number(whole).toLocaleString();
+  return frac ? whole+'.'+frac : whole;
+}
+
+// ---------- boot: decide onboarding vs app ----------
+(async function boot(){
+  try{
+    const d = await api('/api/summary');
+    // If a wallet already exists AND has been used/loaded, skip onboarding.
+    if(d && d.has_wallet){ enterApp(); return; }
+  }catch(e){}
+  // else show onboarding (default visible)
+  document.getElementById('onboard').style.display='flex';
+})();
+</script>
+</body>
+</html>
