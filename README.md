@@ -18,11 +18,9 @@ Requires Python 3. Dependencies are standard-library plus the bundled modules.
 
 ## Current release — v2.17.0
 
-This release ships the **v6 consensus rules**, which are **dormant** until a
-coordinated activation height (`CONSENSUS_V6_HEIGHT` in `sosaiem_node.py`, set to
-**11750**). Below that height the node behaves exactly like v2.16.0, so updated and
-not-yet-updated nodes agree until the flag day. At the activation height, for every
-updated node, these switch on together:
+This release ships the **v6 consensus rules**, which **activated at height 11750**
+and are now live. Below that height the node behaved exactly like v2.16.0; from
+11750 onward these are in force on every updated node:
 
 - **Work-based fork choice** — the heaviest (most cumulative proof-of-work) chain
   wins, not merely the longest. LWMA makes per-block work vary, so "longest" could

@@ -131,7 +131,7 @@ ACTIVE_VALIDATOR_WINDOW = 15 * 60
 # window, faster syncing, bug fixes that only tighten what was already invalid.
 # Nobody has to agree on it and nothing can split over it.
 PROTOCOL_VERSION = 4
-NODE_VERSION = "2.17.0"    # v6 (DORMANT until height 11750): work-based fork choice + median-time-past timestamps. Always-on: push-delivery fix, verified-cache eviction, submit_chain/is_better alignment.
+NODE_VERSION = "2.17.0"    # v6 (ACTIVE since height 11750): work-based fork choice + median-time-past timestamps. Always-on: push-delivery fix, verified-cache eviction, submit_chain/is_better alignment, /network endpoint restored.
 
 # Blocks may carry a small tag naming the build that made them. It is accepted
 # and recorded, never required. A rule that forces everyone onto a particular
@@ -2273,9 +2273,15 @@ def make_handler(node):
                 self._json({"shares": run})
                 return                       # BUGFIX: was falling through into a
                                              # second response, breaking share pull
+
+            elif self.path == "/network":
                 # Compact public summary for the live mint page. Small and cheap
                 # to serve no matter how long the chain gets -- the page must
                 # never have to pull the whole chain just to show activity.
+                # (This handler used to be stranded, unreachable, after the
+                # return above inside /schain_shares, so /network answered
+                # "unknown" and the explorer page could never load. Now it is a
+                # real route.)
                 with node.lock:
                     blocks = list(node.chain.chain)
                     minted = total_minted(node.chain)
