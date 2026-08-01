@@ -133,6 +133,7 @@ textarea.f:focus{border-color:var(--gilt)}
 .sub{display:none} .sub.on{display:block;animation:fade .2s ease}
 td.click{cursor:pointer}
 tr.brow:hover td{background:#16302a}
+tr.hrow{cursor:pointer} tr.hrow:hover td{background:#16302a}
 .me-row td{color:var(--gilt2)!important}
 
 /* block detail modal */
@@ -501,10 +502,25 @@ async function loadHolders(){
   const rows = (d && d.holders) || [];
   document.getElementById('holders').innerHTML = rows.length ? rows.map((h,i)=>{
     const mine = h.address===ADDR;
-    return `<tr class="${mine?'me-row':''}"><td>${i+1}</td>
-      <td style="color:var(--dim)">${h.address.slice(0,10)}\u2026${h.address.slice(-6)}${mine?' (you)':''}</td>
+    return `<tr class="hrow ${mine?'me-row':''}" onclick="toggleAddr(this)" data-addr="${h.address}">
+      <td>${i+1}</td>
+      <td class="haddr" style="color:var(--dim);cursor:pointer">${h.address.slice(0,10)}\u2026${h.address.slice(-6)}${mine?' (you)':''}</td>
       <td>${fmtSosa(h.balance)}</td><td>${(h.share||0).toFixed(2)}%</td></tr>`;
   }).join('') : '<tr><td colspan="4" style="color:var(--dim)">no holders yet</td></tr>';
+}
+// click a holder row to reveal its full address + a copy button
+function toggleAddr(row){
+  const addr = row.getAttribute('data-addr');
+  const cell = row.querySelector('.haddr');
+  if(row.dataset.open==='1'){
+    cell.innerHTML = addr.slice(0,10)+'\u2026'+addr.slice(-6)+(row.classList.contains('me-row')?' (you)':'');
+    row.dataset.open='0';
+  } else {
+    cell.innerHTML = `<span class="mono" style="color:var(--gilt2);word-break:break-all">${addr}</span>
+      <button onclick="event.stopPropagation();navigator.clipboard.writeText('${addr}')"
+        style="background:transparent;color:var(--gilt);font-size:11px;font-weight:700;margin-left:6px">copy</button>`;
+    row.dataset.open='1';
+  }
 }
 
 async function loadTransfers(){

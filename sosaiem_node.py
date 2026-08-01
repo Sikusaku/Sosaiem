@@ -1964,8 +1964,25 @@ class Node:
 
     def get_balances(self):
         balances = compute_balances(self.chain)
+        # Transfers now settle ON-CHAIN (in blocks), so compute_balances already
+        # includes every transfer that made it into a block. The confirmed_log is
+        # the OLD vote-settled record; applying it on top would count any transfer
+        # that is BOTH vote-confirmed AND on-chain twice -- which is exactly the
+        # "app balance higher than the chain" drift. reconcile_chain_transfers
+        # prunes the log, but only scans recent blocks, so a transfer buried deep
+        # could linger in the log and be double-counted. Guard it here: skip any
+        # log entry whose transfer is already in the chain.
+        on_chain_sigs = set()
+        for b in self.chain.chain:
+            for tx in b.transactions:
+                if isinstance(tx, dict) and tx.get("type") == "transfer":
+                    s = tx.get("signature")
+                    if s:
+                        on_chain_sigs.add(s)
         for entry in self.confirmed_log:
             tx = entry["tx"]
+            if tx.get("signature") in on_chain_sigs:
+                continue                      # already counted by the chain
             balances[tx["from"]] = balances.get(tx["from"], 0) - tx["amount"]
             balances[tx["to"]] = balances.get(tx["to"], 0) + tx["amount"]
         return {a: round(b, 8) for a, b in balances.items()}
