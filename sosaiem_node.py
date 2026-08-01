@@ -1892,9 +1892,25 @@ class Node:
             return
         kept = 0
         balances_running = compute_balances(self.chain)   # chain truth; kept transfers applied as we go
+        # Any transfer that already lives in a block is settled by the chain, so
+        # the chain balance above already includes it. Loading it AGAIN from the
+        # old vote-log would count it twice and inflate the balance (the "app
+        # shows more than the chain" bug). Gather on-chain transfer signatures so
+        # we can skip those log entries entirely -- so no user has to delete files.
+        on_chain_sigs = set()
+        for b in self.chain.chain:
+            for t in b.transactions:
+                if isinstance(t, dict) and t.get("type") == "transfer":
+                    s = t.get("signature")
+                    if s:
+                        on_chain_sigs.add(s)
         for entry in log:
             tx, votes = entry.get("tx", {}), entry.get("votes", {})
             sig = tx.get("signature")
+            if sig in on_chain_sigs:
+                # already settled on-chain -> mark confirmed but DON'T re-apply
+                self.confirmed.add(sig)
+                continue
             if not sig or sig in self.confirmed or not transfer_is_valid(tx):
                 continue
             if not all(vote_is_valid(v) for v in votes.values()):
