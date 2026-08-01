@@ -34,6 +34,10 @@ def start_node_network(node):
     threading.Thread(target=core.discovery_beacon, args=(node,), daemon=True).start()
     threading.Thread(target=core.discovery_listener, args=(node,), daemon=True).start()
     threading.Thread(target=core.load_seeds, args=(node,), daemon=True).start()
+    # Keep re-sending our unconfirmed transfers until they land, so a single
+    # failed gossip (busy seed, momentary disconnect) can't silently strand a
+    # send that the app already reported as "sent".
+    threading.Thread(target=core.rebroadcast_transfers, args=(node,), daemon=True).start()
     # Become a REACHABLE node: ask the router to forward our port (UPnP) and
     # confirm with a peer, so other people can join the network THROUGH this app.
     # Every app that succeeds is one less reason the network needs the founder's

@@ -3742,6 +3742,35 @@ def sync(node):
         pass
 
 
+def rebroadcast_transfers(node):
+    """
+    Re-send our still-unconfirmed transfers every so often.
+
+    A transfer is gossiped ONCE when you hit send. If that single push fails --
+    a peer momentarily unreachable, a 2-second timeout against a busy/throttled
+    seed, or the send firing before peers were fully connected -- the transfer
+    used to be stranded in the sender's pending pool forever: the app said
+    "sent", but no other node ever received it, so no miner could carry it into
+    a block. This loop fixes that: as long as a transfer of ours hasn't been
+    confirmed on-chain yet, we keep re-broadcasting it until it lands.
+    """
+    while True:
+        time.sleep(20)
+        try:
+            with node.lock:
+                me = node.wallet.address() if node.wallet else None
+                # our own transfers that haven't been confirmed yet
+                mine = [tx for sig, tx in node.transfers.items()
+                        if sig not in node.confirmed
+                        and tx.get("from") == me]
+            if not mine or not node.peers:
+                continue
+            for tx in mine[:20]:      # cap so we never flood
+                gossip(node, "/tx", tx)
+        except Exception:
+            pass
+
+
 def auto_sync_loop(node):
     # A seed receives blocks pushed to it by miners, so it does not need to go
     # looking for the tip constantly. Checking far less often keeps it idle.
@@ -4941,6 +4970,7 @@ def main():
     node = Node(port)
     start_server(node)
     threading.Thread(target=auto_sync_loop, args=(node,), daemon=True).start()
+    threading.Thread(target=rebroadcast_transfers, args=(node,), daemon=True).start()
     if "--isolated" not in sys.argv:      # test mode: no LAN discovery -> stays sealed off
         threading.Thread(target=discovery_beacon, args=(node,), daemon=True).start()
         threading.Thread(target=discovery_listener, args=(node,), daemon=True).start()
