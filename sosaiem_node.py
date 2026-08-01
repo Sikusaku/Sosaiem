@@ -4829,24 +4829,36 @@ def mining_watchdog(node):
             with node.lock:
                 mine = len(node.chain.chain)
             best_seen = 0
+            best_peer = None
             for p in peers[:6]:
                 info = get_json(p.rstrip("/") + "/info", timeout=4)
                 if info and isinstance(info.get("blocks"), int):
-                    best_seen = max(best_seen, info["blocks"])
-            # A peer is clearly ahead of us and we haven't caught up. We might be
-            # on a private/losing fork. Stop trusting our own tip: mark unsynced
-            # (pauses mining, stops the UI claiming all's well) and force a pull.
-            if best_seen and best_seen > mine + 2:
+                    if info["blocks"] > best_seen:
+                        best_seen = info["blocks"]
+                        best_peer = p
+            # Two danger signs, both handled by pulling the peer's chain and
+            # letting is_better (heaviest-work) decide:
+            #   (a) a peer is clearly AHEAD of us -> we're behind, catch up.
+            #   (b) we are AHEAD of every peer while mining -> we may be on a
+            #       PRIVATE fork (we mined blocks the network never accepted).
+            #       This is the "mined coins vanish on resync" case: our own
+            #       chain looks longest to us, so nothing pulls us back. Compare
+            #       against the peer's chain directly; if theirs is heavier,
+            #       is_better adopts it and our orphaned blocks (and their phantom
+            #       rewards) correctly disappear.
+            ahead_of_all = best_seen and best_seen < mine
+            behind = best_seen and best_seen > mine + 2
+            if behind or ahead_of_all:
                 node.has_synced = False
                 node.watchdog_resyncs = getattr(node, "watchdog_resyncs", 0) + 1
-                add_event(node, f"network is ahead ({best_seen} vs {mine}) -- resyncing")
+                add_event(node, f"reconciling with network (mine {mine}, net {best_seen})")
                 try:
                     sync_chain(node)
                 except Exception:
                     pass
-                # if after the pull we're caught up, we're healthy again
                 with node.lock:
-                    if len(node.chain.chain) >= best_seen - 2:
+                    # synced again if we now agree with the network's height
+                    if best_seen and abs(len(node.chain.chain) - best_seen) <= 2:
                         node.has_synced = True
         except Exception:
             pass
