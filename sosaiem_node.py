@@ -1997,29 +1997,33 @@ class Node:
         return True
 
     def get_balances(self):
+        # Transfers settle ON-CHAIN now, so compute_balances over the chain is the
+        # COMPLETE and correct balance -- every mining reward and every transfer is
+        # already accounted for. The legacy confirmed_log (old vote-era records)
+        # must NOT be applied on top: doing so was double-counting or mis-netting
+        # transfers whose signature didn't exactly match the on-chain copy, which
+        # is what made the app drift higher than the seed (the "sent coins not
+        # subtracted" gap). The chain alone is the single source of truth.
         balances = compute_balances(self.chain)
-        # Transfers now settle ON-CHAIN (in blocks), so compute_balances already
-        # includes every transfer that made it into a block. The confirmed_log is
-        # the OLD vote-settled record; applying it on top would count any transfer
-        # that is BOTH vote-confirmed AND on-chain twice -- which is exactly the
-        # "app balance higher than the chain" drift. reconcile_chain_transfers
-        # prunes the log, but only scans recent blocks, so a transfer buried deep
-        # could linger in the log and be double-counted. Guard it here: skip any
-        # log entry whose transfer is already in the chain.
-        on_chain_sigs = set()
-        for b in self.chain.chain:
-            for tx in b.transactions:
-                if isinstance(tx, dict) and tx.get("type") == "transfer":
-                    s = tx.get("signature")
-                    if s:
-                        on_chain_sigs.add(s)
-        for entry in self.confirmed_log:
-            tx = entry["tx"]
-            if tx.get("signature") in on_chain_sigs:
-                continue                      # already counted by the chain
-            balances[tx["from"]] = balances.get(tx["from"], 0) - tx["amount"]
-            balances[tx["to"]] = balances.get(tx["to"], 0) + tx["amount"]
         return {a: round(b, 8) for a, b in balances.items()}
+
+    def get_settled_balances(self, buffer=3):
+        """
+        The balance the NETWORK agrees on -- computed over the chain EXCLUDING the
+        last few blocks, which a fast miner may have raced ahead on and which the
+        rest of the network hasn't confirmed yet. Those trailing blocks are what
+        made the app show a balance higher than the seed: unsettled mining rewards
+        counted as if final. Trimming them gives the true, confirmed balance that
+        matches what everyone else sees. This is the number to DISPLAY.
+        """
+        if len(self.chain.chain) <= buffer + 1:
+            return self.get_balances()
+        # chain view without the last `buffer` unsettled blocks -- chain is the
+        # sole source of truth (no legacy confirmed_log, which caused drift)
+        settled = Blockchain.__new__(Blockchain)
+        settled.chain = self.chain.chain[:-buffer]
+        bals = compute_balances(settled)
+        return {a: round(b, 8) for a, b in bals.items()}
 
     def all_stake(self, balances=None):
         """
@@ -2193,6 +2197,12 @@ def reconcile_chain_transfers(node):
     # is always caught long before the next block could re-include it.
     need_save = False
     with node.lock:
+        # A transfer is only truly settled once buried deep enough to survive a
+        # reorg. Marking it confirmed and dropping it from the pending pool the
+        # instant it appears in ANY block is what let a 1-block-deep transfer
+        # vanish when its block was later orphaned. So only finalize the ones
+        # that are TRANSFER_SAFE_DEPTH deep; keep the shallow ones pending so
+        # they get re-mined if their block loses a reorg.
         on_chain = set()
         for b in node.chain.chain[-64:]:
             for tx in b.transactions:
@@ -2200,15 +2210,19 @@ def reconcile_chain_transfers(node):
                     sig = tx.get("signature")
                     if sig:
                         on_chain.add(sig)
-        if on_chain:
-            for sig in on_chain:
+        deep = set()
+        for sig in on_chain:
+            if transfer_burial_depth(node.chain, sig) >= TRANSFER_SAFE_DEPTH:
+                deep.add(sig)
+        if deep:
+            for sig in deep:
                 if sig not in node.confirmed:
                     node.confirmed.add(sig); need_save = True
                 if node.transfers.pop(sig, None) is not None:
                     need_save = True
             before = len(node.confirmed_log)
             node.confirmed_log = [e for e in node.confirmed_log
-                                  if e.get("tx", {}).get("signature") not in on_chain]
+                                  if e.get("tx", {}).get("signature") not in deep]
             if len(node.confirmed_log) != before:
                 need_save = True
     if need_save:
@@ -2689,6 +2703,51 @@ def make_handler(node):
                     limit = 40
                 with node.lock:
                     balances = node.get_balances()
+                    # Transfers now settle IN BLOCKS, but this list was only read
+                    # from the old vote-log (confirmed_log) -- so on-chain transfers
+                    # moved coins yet never appeared in the transfers list ("balance
+                    # changed but nothing shows"). Build the list from the actual
+                    # blocks (newest first), then fall back to the legacy vote-log
+                    # for anything not in a block.
+                    chain_txs = []
+                    seen_sigs = set()
+                    for b in reversed(node.chain.chain):
+                        for t in b.transactions:
+                            if isinstance(t, dict) and t.get("type") == "transfer":
+                                s = t.get("signature", "")
+                                if s and s not in seen_sigs:
+                                    seen_sigs.add(s)
+                                    chain_txs.append((t, b.index))
+                    legacy = [(e.get("tx", {}), None) for e in reversed(node.confirmed_log)
+                              if e.get("tx", {}).get("signature", "") not in seen_sigs]
+                    all_confirmed = chain_txs + legacy
+                    total = len(all_confirmed)
+                    out = []
+                    seen = 0
+                    for tx, blk in all_confirmed:
+                        sig = tx.get("signature", "")
+                        if sig_want and not sig.startswith(sig_want):
+                            continue
+                        if not sig_want and seen < offset:
+                            seen += 1
+                            continue
+                        out.append({
+                            "signature": sig,
+                            "from": tx.get("from"), "to": tx.get("to"),
+                            "amount": tx.get("amount"), "timestamp": tx.get("timestamp"),
+                            "block": blk,
+                            "voters": 0, "weight_yes": 0, "weight_no": 0, "votes": [],
+                        })
+                        if len(out) >= (1 if sig_want else limit):
+                            break
+                    pending = [dict(t) for s, t in node.transfers.items()
+                               if s not in node.confirmed][:20]
+                self._json({"confirmed": out, "pending": pending,
+                            "total": total, "offset": offset, "limit": limit})
+
+            elif self.path == "/__old_transfers_disabled__":
+                with node.lock:
+                    balances = node.get_balances()
                     total = len(node.confirmed_log)
                     out = []
                     seen = 0
@@ -2717,9 +2776,7 @@ def make_handler(node):
                         })
                         if len(out) >= (1 if sig_want else limit):
                             break
-                    pending = [{"from": t.get("from"), "to": t.get("to"),
-                                "amount": t.get("amount"), "signature": s}
-                               for s, t in node.transfers.items()
+                    pending = [dict(t) for s, t in node.transfers.items()
                                if s not in node.confirmed][:20]
                 self._json({"confirmed": out, "pending": pending,
                             "total": total, "offset": offset, "limit": limit})
@@ -3847,6 +3904,41 @@ def sync(node):
         pass
 
 
+def pull_pending_transfers(node):
+    """
+    Miners behind a home router can't be PUSHED to -- so a transfer that reaches
+    the seed never reaches them, and since they're the ones mining, the transfer
+    sits pending forever and never lands in a block. This loop closes that gap:
+    every few seconds each node PULLS its peers' pending transfer list and adds
+    any valid ones it's missing to its own pool, so every miner -- reachable or
+    not -- has the transfers and can include them in the next block it mines.
+    """
+    while True:
+        time.sleep(6)
+        try:
+            if not node.peers:
+                continue
+            for p in list(node.peers)[:5]:
+                data = get_json(p.rstrip("/") + "/transfers?limit=25", timeout=5)
+                if not isinstance(data, dict):
+                    continue
+                for tx in data.get("pending", []):
+                    if not isinstance(tx, dict):
+                        continue
+                    sig = tx.get("signature")
+                    if not sig:
+                        continue
+                    with node.lock:
+                        if sig in node.transfers or sig in node.confirmed:
+                            continue
+                        if not transfer_is_valid(tx):
+                            continue
+                        if len(node.transfers) < MAX_TRANSFERS:
+                            node.transfers[sig] = tx
+        except Exception:
+            pass
+
+
 def rebroadcast_transfers(node):
     """
     Re-send our still-unconfirmed transfers every so often.
@@ -4517,6 +4609,25 @@ def discovery_listener(node):
             pass
 
 
+TRANSFER_SAFE_DEPTH = 3   # a transfer is only "safe" once buried this many blocks
+
+
+def transfer_burial_depth(chain, sig):
+    """
+    How many blocks deep a transfer is buried (0 = not on chain at all, 1 = it's
+    in the tip block, etc). Used to decide when a transfer is safe from a reorg:
+    until it's TRANSFER_SAFE_DEPTH deep it must stay eligible for re-inclusion, so
+    a reorg that drops its block can't make it vanish -- it just gets re-mined.
+    """
+    tip = len(chain.chain) - 1
+    for i in range(len(chain.chain) - 1, -1, -1):
+        for tx in chain.chain[i].transactions:
+            if (isinstance(tx, dict) and tx.get("type") == "transfer"
+                    and tx.get("signature") == sig):
+                return tip - i + 1
+    return 0
+
+
 def _mine_one_block_racing(node):
     # each attempt now costs about 22ms, so batches are small enough that the
     # miner still notices a new block arriving within a second or so
@@ -4654,8 +4765,18 @@ def _mine_one_block_racing(node):
                                  key=lambda t: t.get("signature", "")):
                     if picked >= MAX_TRANSFERS_PER_BLOCK:
                         break
-                    if tx.get("signature") in node.confirmed:
-                        continue
+                    sig = tx.get("signature")
+                    # Only skip a transfer once it's buried deep enough that a
+                    # reorg can't drop it. If it's already in THIS chain but still
+                    # shallow, we don't re-add it here (it's in a recent block),
+                    # but we also don't purge it from the pool until it's deep --
+                    # so if that block gets orphaned, it's still pending and gets
+                    # re-mined. A transfer therefore cannot be permanently lost.
+                    depth = transfer_burial_depth(node.chain, sig)
+                    if depth >= TRANSFER_SAFE_DEPTH:
+                        continue                          # safely settled
+                    if depth >= 1:
+                        continue                          # already in a recent block, wait
                     if not transfer_is_valid(tx) or not transfer_work_is_valid(tx):
                         continue
                     frm, to, amt = tx.get("from"), tx.get("to"), tx.get("amount")
@@ -5233,6 +5354,7 @@ def main():
     start_server(node)
     threading.Thread(target=auto_sync_loop, args=(node,), daemon=True).start()
     threading.Thread(target=rebroadcast_transfers, args=(node,), daemon=True).start()
+    threading.Thread(target=pull_pending_transfers, args=(node,), daemon=True).start()
     threading.Thread(target=mining_watchdog, args=(node,), daemon=True).start()
     if "--isolated" not in sys.argv:      # test mode: no LAN discovery -> stays sealed off
         threading.Thread(target=discovery_beacon, args=(node,), daemon=True).start()
