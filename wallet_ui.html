@@ -318,6 +318,17 @@ tr.hrow{cursor:pointer} tr.hrow:hover td{background:#16302a}
         </div>
       </div>
       <div class="card">
+        <h3>Your wallet</h3>
+        <p class="sub">This app is holding one wallet. To switch to a different wallet you already own, paste its 17-word recovery phrase below. <b>Your current wallet is only recoverable from its own phrase &mdash; make sure you have it saved before switching.</b></p>
+        <div id="wswap-addr" class="mono" style="color:var(--dim);font-size:12px;word-break:break-all;margin-bottom:10px">&mdash;</div>
+        <textarea id="wswap-phrase" placeholder="word1 word2 word3 &hellip; word17"
+          style="width:100%;min-height:64px;background:#0d211c;border:1px solid #24463d;border-radius:10px;color:var(--fg);padding:10px;font-family:inherit;resize:vertical"></textarea>
+        <div style="margin-top:10px;display:flex;gap:10px;align-items:center">
+          <button class="btn" onclick="swapWallet()">Switch to this wallet</button>
+          <span id="wswap-msg" style="font-size:13px;color:var(--dim)"></span>
+        </div>
+      </div>
+      <div class="card">
         <h3>Known nodes</h3>
         <p class="sub">The ways into the network this node currently knows.</p>
         <div class="feed" id="nodelist">finding nodes&hellip;</div>
@@ -362,6 +373,19 @@ async function obImport(){
   const r=await api('/api/wallet/import',{phrase});
   if(r && r.ok){ enterApp(); }
   else { msg.className='msg err'; msg.textContent=(r&&r.error)||'could not restore from those words.'; }
+}
+async function swapWallet(){
+  const ta=document.getElementById('wswap-phrase');
+  const msg=document.getElementById('wswap-msg');
+  const phrase=(ta.value||'').trim();
+  if(phrase.split(/\s+/).length < 12){ msg.style.color='#e0a3a3'; msg.textContent='that doesn\u2019t look like a full recovery phrase.'; return; }
+  if(!confirm('Switch to a different wallet? Your current wallet stays safe, but this app will start showing the imported one. Make sure you have your current wallet\u2019s phrase saved.')) return;
+  msg.style.color='var(--dim)'; msg.textContent='importing\u2026';
+  try{
+    const r=await api('/api/wallet/import',{phrase});
+    if(r && r.ok){ msg.style.color='#8fd6b4'; msg.textContent='switched \u2014 reloading\u2026'; ta.value=''; setTimeout(()=>location.reload(), 800); }
+    else { msg.style.color='#e0a3a3'; msg.textContent=(r&&r.error)||'could not import those words.'; }
+  }catch(e){ msg.style.color='#e0a3a3'; msg.textContent='import failed.'; }
 }
 function enterApp(){
   document.getElementById('onboard').style.display='none';
@@ -432,6 +456,7 @@ async function tick(){
   document.getElementById('n-peers').textContent=(d.peers||[]).length;
   document.getElementById('n-synced').textContent = d.synced===false?'syncing\u2026':'yes';
   document.getElementById('n-minted').textContent=(d.minted||0).toLocaleString();
+  const wsa=document.getElementById('wswap-addr'); if(wsa&&ADDR) wsa.textContent='current: '+ADDR;
   const rb=document.getElementById('reach-banner');
   if(rb){
     if(d.reachable){

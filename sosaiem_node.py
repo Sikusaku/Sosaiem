@@ -1788,8 +1788,26 @@ class Node:
             pass
 
     def save_chain(self):
-        with open(self.chain_file, "w") as f:
-            json.dump(chain_to_list(self.chain), f)
+        # During a fork/reorg storm the chain can change many times per second.
+        # Saving on every single change (a) hammers the disk and (b) piles up
+        # file descriptors fast enough to hit the OS "Too many open files" limit
+        # and crash the miner. Throttle to at most once every few seconds, and
+        # write atomically via a temp file (never a half-written chain, and the
+        # handle is always closed even if json.dump raises).
+        now = time.time()
+        last = getattr(self, "_last_chain_save", 0)
+        if now - last < 3:
+            self._chain_save_pending = True
+            return
+        self._last_chain_save = now
+        self._chain_save_pending = False
+        try:
+            tmp = self.chain_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(chain_to_list(self.chain), f)
+            os.replace(tmp, self.chain_file)   # atomic
+        except Exception:
+            pass
 
     def save_share_chain(self):
         """Persist the share-chain so a restart doesn't wipe it. Best-effort:
@@ -4864,6 +4882,34 @@ def mining_watchdog(node):
             pass
 
 
+def mining_is_ahead(node):
+    """
+    True if our chain tip is ahead of every peer we can currently reach.
+
+    Used to pause mining until the network catches up, so a fast miner (or one
+    with slow-propagating peers) stops running down its own private branch. The
+    peer heights are cached for a couple of seconds so this can be called in the
+    tight mining loop without hammering the network.
+    """
+    now = time.time()
+    cache = getattr(node, "_ahead_cache", None)
+    if cache and now - cache[0] < 2.5:
+        best_seen = cache[1]
+    else:
+        best_seen = 0
+        for p in list(node.peers)[:6]:
+            info = get_json(p.rstrip("/") + "/info", timeout=4)
+            if info and isinstance(info.get("blocks"), int):
+                best_seen = max(best_seen, info["blocks"])
+        node._ahead_cache = (now, best_seen)
+    if not best_seen:
+        return False          # no peer heights -> don't block mining
+    with node.lock:
+        mine = len(node.chain.chain)
+    # a small cushion so we don't stall on a normal 1-block lead
+    return mine > best_seen + 1
+
+
 def mining_loop(node):
     node.mine_stats = {"start": time.time(), "earned": 0.0, "blocks": 0}
     last_tick = time.time()
@@ -4875,6 +4921,41 @@ def mining_loop(node):
                   f"session stats reset)")
             node.mine_stats = {"start": now, "earned": 0.0, "blocks": 0}
         last_tick = now
+        # DECENTRALIZED FORK DISCIPLINE:
+        # Before striking the next block, make sure we're building on the
+        # network's real tip -- not on our own block that the network may not
+        # have accepted yet. A node that wins many blocks in a row (common when
+        # it holds a lot of the hashrate on a small network) would otherwise keep
+        # extending its OWN chain and race ahead onto a private fork, ending up
+        # with a phantom balance that vanishes on the next resync. Pulling the
+        # tip here keeps every miner independent and equal (no coordinator), but
+        # forces them to mine on the shared chain like a decentralized coin
+        # should. Cheap: only re-checks if we have peers and enough time passed.
+        if node.peers and (now - getattr(node, "_last_premine_sync", 0) > 3):
+            node._last_premine_sync = now
+            try:
+                sync_chain(node)
+            except Exception:
+                pass
+        # STOP-AND-WAIT-FOR-CONSENSUS (the community's fix for the fork war):
+        # If our chain is already ahead of what our peers have, DON'T race off and
+        # mine the next block on top of our own tip -- that's what makes every
+        # miner run down its own branch and forces constant reorgs. Instead, pause
+        # briefly and let the network catch up / agree, so all miners converge on
+        # the same tip and then work the next block together. This is checked
+        # against peers directly (cheap /info poll, cached a few seconds).
+        if node.peers and mining_is_ahead(node):
+            add_event(node, "ahead of the network -- pausing so peers can catch up")
+            waited = 0.0
+            while node.mining and waited < 30:
+                time.sleep(1.0); waited += 1.0
+                try:
+                    sync_chain(node)
+                except Exception:
+                    pass
+                if not mining_is_ahead(node):
+                    break   # network caught up (or passed us) -- resume together
+            continue        # re-loop: re-sync, re-check, then mine on the shared tip
         if remaining_supply(node.chain) <= 0:
             print("   cap reached -- all 12,212,010 SOSA now exist. Mining is done;")
             print("   transfers continue by vote, feeless, forever.")
