@@ -2490,13 +2490,27 @@ def make_handler(node):
                 # chain -- which is what kept pull-only miners trailing the tip.
                 q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 frm = q.get("from", [None])[0]
+                cnt = q.get("count", [None])[0]
                 if frm is not None:
                     try:
                         n = max(0, int(frm))
                     except ValueError:
                         n = 0
+                    # Optional &count=K returns at most K blocks from N, so a node
+                    # far behind on a slow/bandwidth-capped link can page the
+                    # chain in small pieces that each finish well within a timeout,
+                    # instead of one huge transfer that never completes.
+                    limit = None
+                    if cnt is not None:
+                        try:
+                            limit = max(1, int(cnt))
+                        except ValueError:
+                            limit = None
                     with node.lock:
-                        part = [block_to_dict(b) for b in node.chain.chain[n:]]
+                        if limit is not None:
+                            part = [block_to_dict(b) for b in node.chain.chain[n:n + limit]]
+                        else:
+                            part = [block_to_dict(b) for b in node.chain.chain[n:]]
                     self._json(part)
                 else:
                     self._json_raw(_cached_chain_payload(node))
@@ -3596,7 +3610,25 @@ def sync_chain(node):
         # download below. Links-only validation keeps a slow CPU at the tip.
         try:
             cur = len(node.chain.chain)
-            part = get_json(peer.rstrip("/") + "/chain?from=" + str(cur), timeout=30)
+            # Pull in batches of 500 from our current tip. Each batch is a small,
+            # quick transfer that completes within the timeout even on a tightly
+            # bandwidth-capped seed -- so a node starting from block 1 can catch
+            # up 500 blocks at a time instead of choking on one giant download
+            # that never finishes. We extend our own chain batch by batch.
+            part = []
+            probe = get_json(peer.rstrip("/") + "/chain?from=" + str(cur) + "&count=500", timeout=30)
+            if isinstance(probe, list):
+                part = probe
+                # keep paging while full batches keep coming and they link on
+                guard = 0
+                while len(probe) == 500 and guard < 200:
+                    guard += 1
+                    nxt = cur + len(part)
+                    probe = get_json(peer.rstrip("/") + "/chain?from=" + str(nxt) + "&count=500", timeout=30)
+                    if isinstance(probe, list) and probe:
+                        part += probe
+                    else:
+                        break
         except Exception:
             part = None
         if isinstance(part, list) and part and isinstance(part[0], dict) \
