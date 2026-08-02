@@ -40,6 +40,8 @@ def start_node_network(node):
     threading.Thread(target=core.rebroadcast_transfers, args=(node,), daemon=True).start()
     # Miners behind a router can't be pushed transfers -- pull them so they can mine them.
     threading.Thread(target=core.pull_pending_transfers, args=(node,), daemon=True).start()
+    # Pull other miners' work-shares fast so fair-work pays every active miner.
+    threading.Thread(target=core.share_pull_loop, args=(node,), daemon=True).start()
     # Watchdog: detect when we've drifted onto a losing chain and force a resync,
     # so a miner can't quietly waste work on a fork the network will reject.
     threading.Thread(target=core.mining_watchdog, args=(node,), daemon=True).start()

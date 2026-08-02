@@ -2007,21 +2007,25 @@ class Node:
         balances = compute_balances(self.chain)
         return {a: round(b, 8) for a, b in balances.items()}
 
-    def get_settled_balances(self, buffer=3):
+    def get_settled_balances(self, buffer=4):
         """
-        The balance the NETWORK agrees on -- computed over the chain EXCLUDING the
-        last few blocks, which a fast miner may have raced ahead on and which the
-        rest of the network hasn't confirmed yet. Those trailing blocks are what
-        made the app show a balance higher than the seed: unsettled mining rewards
-        counted as if final. Trimming them gives the true, confirmed balance that
-        matches what everyone else sees. This is the number to DISPLAY.
+        The balance the NETWORK agrees on -- computed up to a settled block height
+        that is the SAME across nodes even when their tips differ by a block or
+        two. We take (height - buffer) and snap it DOWN to a fixed 5-block
+        boundary, so a node at height 21 and a node at height 20 both settle to
+        the same cutoff block and therefore show the IDENTICAL balance. This is
+        what a user sees and spends against: one stable number, no flicker
+        between the app and the mint, and never counting unconfirmed mining.
         """
-        if len(self.chain.chain) <= buffer + 1:
+        h = len(self.chain.chain)
+        if h <= buffer + 1:
             return self.get_balances()
-        # chain view without the last `buffer` unsettled blocks -- chain is the
-        # sole source of truth (no legacy confirmed_log, which caused drift)
+        cutoff = h - buffer
+        cutoff = (cutoff // 5) * 5          # snap to a 5-block boundary (shared)
+        if cutoff < 1:
+            return self.get_balances()
         settled = Blockchain.__new__(Blockchain)
-        settled.chain = self.chain.chain[:-buffer]
+        settled.chain = self.chain.chain[:cutoff]
         bals = compute_balances(settled)
         return {a: round(b, 8) for a, b in bals.items()}
 
@@ -2232,6 +2236,7 @@ def reconcile_chain_transfers(node):
 def api_summary(node):
     with node.lock:
         balances = node.get_balances()
+        settled = node.get_settled_balances()   # stable, confirmed view for the user's own balance
         me = node.wallet.address()
         total = node.total_stake(balances)
         pend = [(s, t) for s, t in node.transfers.items() if s not in node.confirmed]
@@ -2278,8 +2283,8 @@ def api_summary(node):
                 "reachable": bool(getattr(node, "reachable", False)),
                 "public_url": getattr(node, "public_url", None),
                 "version": NODE_VERSION,
-                "balance": round(balances.get(me, 0), 8),
-                "available": round(balances.get(me, 0) - pend_out, 8),
+                "balance": round(settled.get(me, 0), 8),
+                "available": round(settled.get(me, 0) - pend_out, 8),
                 "blocks": len(node.chain.chain),
                 "minted": round(total_minted(node.chain), 4),
                 "max_supply": MAX_SUPPLY,
@@ -2865,7 +2870,7 @@ def make_handler(node):
                         moves = moves[:limit]
                     self._json({
                         "address": a,
-                        "balance": round(node.get_balances().get(a, 0.0), 8),
+                        "balance": round(node.get_settled_balances().get(a, 0.0), 8),
                         "mined": round(mined, 8),
                         "blocks_paid": blocks_paid,
                         "first_block": first, "last_block": last,
@@ -3787,6 +3792,39 @@ def sync_transfers(node):
                 node.save_transfers()
         for sig in adopted:
             announce_confirm(node, sig)
+
+
+def share_pull_loop(node):
+    """
+    Frequently pull other miners' work-shares so the fair-work split includes
+    everyone who's actually mining -- not just whoever's shares happened to
+    arrive during the last full sync.
+
+    Fair-work pays each block proportionally to recent work-shares. But a miner
+    behind a home router can't be pushed to, and shares pulled only during the
+    slower sync loop often arrive AFTER a block is already built -- so that miner
+    keeps mining yet misses blocks, which looks like the split being unfair. This
+    loop pulls shares every few seconds (both the current-tip shares and the
+    share-chain used for payout), so a co-miner's work reaches the block-builder
+    in time to be counted and paid.
+    """
+    if getattr(node, "seed_only", False):
+        return
+    while True:
+        time.sleep(4)
+        try:
+            if not node.peers:
+                continue
+            try:
+                pull_shares(node)
+            except Exception:
+                pass
+            try:
+                pull_schain(node)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
 
 def pull_shares(node):
@@ -5355,6 +5393,7 @@ def main():
     threading.Thread(target=auto_sync_loop, args=(node,), daemon=True).start()
     threading.Thread(target=rebroadcast_transfers, args=(node,), daemon=True).start()
     threading.Thread(target=pull_pending_transfers, args=(node,), daemon=True).start()
+    threading.Thread(target=share_pull_loop, args=(node,), daemon=True).start()
     threading.Thread(target=mining_watchdog, args=(node,), daemon=True).start()
     if "--isolated" not in sys.argv:      # test mode: no LAN discovery -> stays sealed off
         threading.Thread(target=discovery_beacon, args=(node,), daemon=True).start()
