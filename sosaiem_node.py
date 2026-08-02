@@ -3440,6 +3440,20 @@ def handle_incoming_tx(node, tx):
     with node.lock:
         if sig in node.transfers:
             return "duplicate"
+        # If we think this transfer is already confirmed, double-check it's
+        # actually still in a block. A transfer can be confirmed, then have its
+        # block orphaned by a reorg -- leaving it confirmed in memory but absent
+        # from the real chain, so it silently never settles ("showed on the mint,
+        # then vanished"). If the sender re-broadcasts it and it's NOT on-chain
+        # anymore, take it back as pending so a new block can include it.
+        if sig in node.confirmed:
+            on_chain = any(
+                isinstance(t, dict) and t.get("type") == "transfer"
+                and t.get("signature") == sig
+                for b in node.chain.chain for t in b.transactions)
+            if on_chain:
+                return "duplicate"           # genuinely settled -- ignore
+            node.confirmed.discard(sig)      # orphaned -- allow re-inclusion
         if len(node.transfers) >= MAX_TRANSFERS:
             return "busy"                     # refuse to grow without bound
         node.transfers[sig] = tx
