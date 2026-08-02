@@ -225,6 +225,11 @@ tr.hrow{cursor:pointer} tr.hrow:hover td{background:#16302a}
         <label class="f">PAYOUT ADDRESS</label>
         <input class="f" id="payout" placeholder="SOSA...">
         <div style="height:14px"></div>
+        <label class="f">CPU THREADS &mdash; <span id="thr-val">?</span> <span id="thr-max" style="color:var(--dim)"></span></label>
+        <input type="range" id="thr-range" min="1" max="8" value="1"
+               style="width:100%;accent-color:var(--gilt)" oninput="onThreads(this.value)">
+        <div class="sub" style="margin-top:4px">More threads = more mining power, more CPU. Set it below your core count to keep your PC responsive.</div>
+        <div style="height:14px"></div>
         <button class="btn" id="minebtn" onclick="toggleMine()">START MINING</button>
         <div class="msg dim" id="minemsg">idle</div>
       </div>
@@ -403,6 +408,8 @@ function go(page, el){
 
 // ---------- actions ----------
 function copyAddr(){navigator.clipboard.writeText(ADDR);}
+let THREADS = 1;
+function onThreads(v){ THREADS = parseInt(v)||1; document.getElementById('thr-val').textContent = THREADS; }
 async function toggleMine(){
   const on = !MINING;
   MINING_WANTED = on;
@@ -410,7 +417,7 @@ async function toggleMine(){
   if(on && !(payout.startsWith('SOSA') && payout.length===44)){
     setMsg('minemsg','that isn\u2019t a SOSA address','err'); MINING_WANTED=false; return;
   }
-  const r = await api('/api/mine', {on, payout});
+  const r = await api('/api/mine', {on, payout, threads: THREADS});
   MINING = r.mining;
   updateMineBtn();
   if(on && !r.mining) setMsg('minemsg','catching up to the network first \u2014 mining will start automatically once synced','dim');
@@ -440,6 +447,18 @@ async function tick(){
   if(!document.getElementById('payout').value) document.getElementById('payout').value = ADDR;
 
   MINING = d.mining;
+  // set up the thread slider once, from the node's real CPU count
+  if(!window._thrInit && d.cpu_count){
+    window._thrInit = true;
+    const rng=document.getElementById('thr-range');
+    if(rng){
+      rng.max = d.cpu_count;
+      THREADS = d.threads || Math.max(1, Math.floor(d.cpu_count/2));
+      rng.value = THREADS;
+      document.getElementById('thr-val').textContent = THREADS;
+      document.getElementById('thr-max').textContent = '(of '+d.cpu_count+' cores)';
+    }
+  }
   document.getElementById('s-earned').textContent=(d.session_earned||0).toFixed(6);
   document.getElementById('s-rate').textContent = d.mining?('~'+(d.rate||0)+'/hr'):'\u2014';
   document.getElementById('s-height').textContent = d.blocks||'\u2014';

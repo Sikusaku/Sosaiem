@@ -2292,6 +2292,8 @@ def api_summary(node):
                 "total_stake": round(total, 8),
                 "peers": sorted(node.peers),
                 "mining": node.mining,
+                "threads": getattr(node, "mine_threads", 1),
+                "cpu_count": os.cpu_count() or 1,
                 "rate": rate,
                 "session_earned": round(st["earned"], 6),
                 "confirmed": len(node.confirmed),
@@ -2909,8 +2911,18 @@ def make_handler(node):
                 pa = body.get("payout")
                 if isinstance(pa, str) and pa.startswith("SOSA") and len(pa) == 44:
                     node.payout_address = pa
+                # Let the UI choose how many CPU threads to mine with (freebyte's
+                # ask: the app had no thread control, so double-click users were
+                # stuck on the default and couldn't use their full CPU).
+                th = body.get("threads")
+                if th is not None:
+                    try:
+                        node.mine_threads = max(1, min(32, int(th)))
+                    except (ValueError, TypeError):
+                        pass
                 msg = start_mining(node) if body.get("on") else stop_mining(node)
                 self._json({"ok": True, "mining": node.mining,
+                            "threads": node.mine_threads,
                             "message": msg.split("\n")[0]})
 
             elif self.path == "/api/wallet/new":
