@@ -2229,8 +2229,12 @@ def api_summary(node):
             return round((100 * yes / total) if total > 0 else 0.0)
 
         pend_out = sum(t.get("amount", 0) for _, t in pend if t.get("from") == me)
+        # Holder % should be a share of ALL coins in existence, not of the
+        # online-voting stake (which is much smaller and made percentages exceed
+        # 100%). Use the sum of everyone's balance as the denominator.
+        coins_total = sum(max(b, 0.0) for b in balances.values())
         holders = [{"address": a, "balance": round(b, 8),
-                    "pct": round(100 * b / total, 1) if total > 0 else 0.0,
+                    "pct": round(100 * b / coins_total, 1) if coins_total > 0 else 0.0,
                     "me": a == me}
                    for a, b in sorted(balances.items(), key=lambda kv: -kv[1])
                    if b > 1e-9][:8]
@@ -3400,6 +3404,7 @@ def handle_submit_chain(node, data):
     adopted = False
     with node.lock:
         if is_better(cand, node.chain):
+            _recover_orphaned_transfers(node, node.chain, cand)
             node.chain = cand
             node.save_chain()
             node._ensure_share_height()
@@ -3609,6 +3614,7 @@ def sync_chain(node):
     switched = False
     with node.lock:
         if is_better(best, node.chain):
+            _recover_orphaned_transfers(node, node.chain, best)
             node.chain = best
             node.save_chain()
             node._ensure_share_height()
@@ -4880,6 +4886,36 @@ def mining_watchdog(node):
                         node.has_synced = True
         except Exception:
             pass
+
+
+def _recover_orphaned_transfers(node, old_chain, new_chain):
+    """
+    When a reorg swaps our chain, any transfer that was in a block on the OLD
+    chain but is NOT in the NEW chain has effectively been un-mined. Without
+    this, that transfer just vanishes -- the sender saw "waiting for a block",
+    then it disappeared on the next reorg, and never arrived. Here we find those
+    dropped transfers and put them back into the pending pool so a future block
+    re-includes them, and clear them from `confirmed` so they can be re-mined.
+    """
+    try:
+        new_sigs = set()
+        for b in new_chain.chain:
+            for tx in b.transactions:
+                if isinstance(tx, dict) and tx.get("type") == "transfer" and tx.get("signature"):
+                    new_sigs.add(tx["signature"])
+        for b in old_chain.chain:
+            for tx in b.transactions:
+                if not (isinstance(tx, dict) and tx.get("type") == "transfer"):
+                    continue
+                sig = tx.get("signature")
+                if not sig or sig in new_sigs:
+                    continue
+                # dropped by the reorg -> make it pending again
+                if transfer_is_valid(tx):
+                    node.transfers[sig] = tx
+                    node.confirmed.discard(sig)
+    except Exception:
+        pass
 
 
 def mining_is_ahead(node):
