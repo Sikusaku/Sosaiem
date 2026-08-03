@@ -3694,38 +3694,47 @@ def sync_chain(node):
         # download below. Links-only validation keeps a slow CPU at the tip.
         try:
             cur = len(node.chain.chain)
-            # Pull in batches of 500 from our current tip. Each batch is a small,
-            # quick transfer that completes within the timeout even on a tightly
-            # bandwidth-capped seed -- so a node starting from block 1 can catch
-            # up 500 blocks at a time instead of choking on one giant download
-            # that never finishes. We extend our own chain batch by batch.
-            part = []
-            probe = get_json(peer.rstrip("/") + "/chain?from=" + str(cur) + "&count=500", timeout=30)
-            if isinstance(probe, list):
-                part = probe
-                # keep paging while full batches keep coming and they link on
-                guard = 0
-                while len(probe) == 500 and guard < 200:
-                    guard += 1
-                    nxt = cur + len(part)
-                    probe = get_json(peer.rstrip("/") + "/chain?from=" + str(nxt) + "&count=500", timeout=30)
-                    if isinstance(probe, list) and probe:
-                        part += probe
+            # Pull in batches of 500 and APPLY EACH BATCH AS IT ARRIVES. The old
+            # code accumulated every batch (all ~16k blocks from a fresh start)
+            # into one list, then built and validated the whole chain at the end
+            # -- if anything anywhere failed, the entire download was thrown away
+            # and the node stayed stuck at height 1 reporting "synced". Committing
+            # each 500-block batch as we go means steady, visible progress and no
+            # all-or-nothing failure.
+            applied_any = False
+            guard = 0
+            while guard < 400:
+                guard += 1
+                cur = len(node.chain.chain)
+                batch = get_json(peer.rstrip("/") + "/chain?from=" + str(cur) + "&count=100", timeout=45)
+                if not (isinstance(batch, list) and batch):
+                    break
+                if not (isinstance(batch[0], dict)
+                        and batch[0].get("index") == cur
+                        and batch[0].get("previous_hash") == node.chain.last_block.compute_hash()):
+                    break   # doesn't join our tip -> fall through to full/other logic
+                try:
+                    merged = chain_to_list(node.chain) + batch
+                    c = list_to_chain(merged)
+                    if (c.chain and c.chain[0].compute_hash() == _CANONICAL_GENESIS_HASH
+                            and c.is_chain_valid(links_only=True)):
+                        with node.lock:
+                            if len(c.chain) > len(node.chain.chain):
+                                node.chain = c
+                                applied_any = True
+                                node.save_chain()
                     else:
                         break
+                except Exception:
+                    break
+                if len(batch) < 100:
+                    break   # that was the last (partial) batch -- caught up
+            part = None
+            cand = node.chain if applied_any else None
         except Exception:
             part = None
-        if isinstance(part, list) and part and isinstance(part[0], dict) \
-                and part[0].get("index") == cur \
-                and part[0].get("previous_hash") == node.chain.last_block.compute_hash():
-            try:
-                merged = chain_to_list(node.chain) + part
-                c = list_to_chain(merged)
-                if (c.chain and c.chain[0].compute_hash() == _CANONICAL_GENESIS_HASH
-                        and c.is_chain_valid(links_only=True)):
-                    cand = c
-            except Exception:
-                cand = None
+        if False:  # (legacy accumulate-then-validate path, replaced by the loop above)
+            pass
         # FALLBACK: the whole chain (original behaviour) -- far behind, a reorg,
         # or a peer without ?from support. A once-per-catch-up cost; give it room.
         if cand is None:
@@ -4419,7 +4428,22 @@ def load_seeds(node):
             sync(node)
         except Exception:
             pass
-        node.has_synced = True
+        # Only call ourselves synced if we ACTUALLY caught up. The old code set
+        # this True unconditionally right after attempting one sync -- so if that
+        # sync didn't complete (slow peer, timed-out batch), the node sat at
+        # height 1 but reported "synced", the balance showed 0, and it never
+        # tried again. Verify against peers: synced only if we're within a couple
+        # blocks of the best height anyone reports.
+        try:
+            best_seen = 0
+            for p in list(node.peers)[:6]:
+                info = get_json(p.rstrip("/") + "/info", timeout=4)
+                if info and isinstance(info.get("blocks"), int):
+                    best_seen = max(best_seen, info["blocks"])
+            mine = len(node.chain.chain)
+            node.has_synced = bool(best_seen) and mine >= best_seen - 2
+        except Exception:
+            node.has_synced = False
         return True
 
     if not tried:
