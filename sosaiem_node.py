@@ -1282,6 +1282,13 @@ _verified_work = {}
 # under a pile of later work; re-hashing them forever bought nothing and cost
 # the miner most of its speed.
 _verify_gate = threading.Semaphore(1)
+# Limit how many big /chain downloads run at once. On the bandwidth-capped seed a
+# full chain transfer holds a worker for 30+ seconds; several at once tie up the
+# whole pool so quick /info calls get no worker and time out ("empty reply from
+# server" -- exactly what a syncing node sees right before it falls behind).
+# Capping heavy transfers keeps a lane open for the small, fast requests that
+# keep peers in sync.
+_chain_serve_gate = threading.Semaphore(3)
 
 # Only one push and one sync may be in flight at a time. Six different events --
 # a block arriving, a share, a vote -- each used to start a fresh thread, and on
@@ -2534,7 +2541,10 @@ def make_handler(node):
                             part = [block_to_dict(b) for b in node.chain.chain[n:]]
                     self._json(part)
                 else:
-                    self._json_raw(_cached_chain_payload(node))
+                    # Full-chain download is the heavy one -- gate it so a burst of
+                    # them can't tie up every worker and starve /info.
+                    with _chain_serve_gate:
+                        self._json_raw(_cached_chain_payload(node))
             elif self.path == "/state":
                 with node.lock:
                     cut = time.time() - ACTIVE_VALIDATOR_WINDOW
@@ -5151,16 +5161,30 @@ def mining_is_ahead(node):
     else:
         best_seen = 0
         for p in list(node.peers)[:6]:
-            info = get_json(p.rstrip("/") + "/info", timeout=4)
+            info = get_json(p.rstrip("/") + "/info", timeout=2)
             if info and isinstance(info.get("blocks"), int):
                 best_seen = max(best_seen, info["blocks"])
+        if best_seen:
+            node._last_known_net = best_seen        # remember it
         node._ahead_cache = (now, best_seen)
     if not best_seen:
-        return False          # no peer heights -> don't block mining
+        # Couldn't reach anyone this cycle (e.g. the seed is briefly overloaded).
+        # Don't assume we're free to race ahead -- fall back to the last network
+        # height we DID see. If our chain is already past it, pause; a slow seed
+        # is exactly when a fast miner runs away and forks.
+        lk = getattr(node, "_last_known_net", 0)
+        if lk:
+            with node.lock:
+                mine = len(node.chain.chain)
+            return mine > lk
+        return False          # never seen a peer height -> don't block mining
     with node.lock:
         mine = len(node.chain.chain)
-    # a small cushion so we don't stall on a normal 1-block lead
-    return mine > best_seen + 1
+    # Pause as soon as we're AHEAD of the network at all. The old +1 cushion let
+    # a fast miner win block after block while sitting exactly one block ahead --
+    # it never tripped the check, so the "pause" never fired. Being ahead by even
+    # one block means the network hasn't accepted our latest yet, so we wait.
+    return mine > best_seen
 
 
 def mining_loop(node):
@@ -5227,6 +5251,17 @@ def mining_loop(node):
         node.mine_stats["blocks"] += 1
         threading.Thread(target=broadcast_block, args=(node, block), daemon=True).start()
         threading.Thread(target=push_chain_once, args=(node,), daemon=True).start()
+        # Give the network a beat to receive and accept this block before we start
+        # the next one. Without this, a fast miner on low difficulty wins several
+        # blocks back-to-back faster than they propagate, building a private
+        # streak the network then has to reorg. A short courtesy pause lets peers
+        # catch up so everyone mines the next block on the same tip.
+        if node.peers:
+            time.sleep(1.5)
+            try:
+                sync_chain(node)
+            except Exception:
+                pass
         elapsed = time.time() - node.mine_stats["start"]
         rate_hr = (node.mine_stats["earned"] / elapsed * 3600) if elapsed > 0 else 0
         add_event(node, f"won block {len(node.chain.chain) - 1}: +{my_cut:.6f} SOSA "
