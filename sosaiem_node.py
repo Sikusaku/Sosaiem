@@ -226,6 +226,48 @@ SHARE_WINDOW = 15
 # testing (including a deliberately-throttled "Pi" node proving it gets paid).
 # ===========================================================================
 FAIRWORK_HEIGHT = 15555           # FLAG DAY: fair-work payout activates at block 15555.
+
+# ---------------------------------------------------------------------------
+# FINALITY (flag day 17000) -- born from the 16674-16750 deep reorg that erased
+# ~77 explorer-confirmed blocks when the chain split healed. Confirmed work must
+# STAY confirmed: once a block is buried FINALITY_DEPTH deep, this node will
+# refuse to adopt ANY chain that rewrites it, no matter how heavy. A fork can
+# still happen on a small network -- but it can no longer silently rewrite an
+# hour of settled history; the network loudly stops agreeing instead, while the
+# split-detector (below) surfaces it within minutes so it's healed while still
+# shallow. Activates at FINALITY_HEIGHT so every updated node switches at the
+# same block, exactly the flag-day rollout the community asked for -- deploying
+# this file changes nothing until the chain reaches that height.
+# ---------------------------------------------------------------------------
+FINALITY_HEIGHT = 17000           # FLAG DAY: finality activates at this block
+FINALITY_DEPTH = 60               # blocks this deep (~1 hour) are final
+
+
+def finality_active(height):
+    return FINALITY_HEIGHT is not None and height >= FINALITY_HEIGHT
+
+
+def violates_finality(cur_chain, cand_chain):
+    """
+    True if adopting cand_chain would rewrite a FINALIZED block of cur_chain --
+    i.e. the two disagree at (our tip - FINALITY_DEPTH). Cheap: one hash compare
+    at a single height, no chain walk. Returns False before the flag day, on a
+    young chain, or when the candidate agrees with our finalized history (a
+    normal shallow reorg near the tip stays allowed).
+    """
+    try:
+        h = len(cur_chain.chain)
+        if not finality_active(h):
+            return False
+        boundary = h - FINALITY_DEPTH
+        if boundary < 1:
+            return False                       # chain too young to have finality
+        if len(cand_chain.chain) <= boundary:
+            return True                        # candidate rewinds past finality
+        return (cand_chain.chain[boundary].compute_hash()
+                != cur_chain.chain[boundary].compute_hash())
+    except Exception:
+        return False                           # never let a bug freeze sync
 FAIRWORK_SHARE_EASE = 4096        # shares ~4096x easier than a block -> any device lands them
 FAIRWORK_WINDOW = 30              # a share stays payable across ~30 blocks (~30 min)
 FAIRWORK_MAX_SHARES = 256         # more room, since easy shares are more numerous
@@ -2299,6 +2341,7 @@ def api_summary(node):
                 "total_stake": round(total, 8),
                 "peers": sorted(node.peers),
                 "mining": node.mining,
+                "split_warning": bool(getattr(node, "split_detected", False)),
                 "threads": getattr(node, "mine_threads", 1),
                 "cpu_count": os.cpu_count() or 1,
                 "rate": rate,
@@ -3501,7 +3544,7 @@ def handle_submit_chain(node, data):
             return "invalid"
     adopted = False
     with node.lock:
-        if is_better(cand, node.chain):
+        if is_better(cand, node.chain) and not violates_finality(node.chain, cand):
             _recover_orphaned_transfers(node, node.chain, cand)
             node.chain = cand
             node.save_chain()
@@ -3752,7 +3795,7 @@ def sync_chain(node):
         return
     switched = False
     with node.lock:
-        if is_better(best, node.chain):
+        if is_better(best, node.chain) and not violates_finality(node.chain, best):
             _recover_orphaned_transfers(node, node.chain, best)
             node.chain = best
             node.save_chain()
@@ -5211,6 +5254,63 @@ def mining_is_ahead(node):
     return mine > best_seen
 
 
+def split_detect_loop(node):
+    """
+    Catch a chain split in MINUTES, not days. Every cycle we take our block hash
+    at a settled height (tip - 30) and ask each peer for THEIR block at that same
+    height. If a majority of responding peers carry a different history there, we
+    are on a branch -- so raise a loud, visible warning (event log + summary flag
+    the UI shows) instead of silently confirming blocks on a doomed fork. The
+    16674-16750 reorg only erased confirmed work because the split ran undetected
+    for days; caught at minutes old, a fork is 1-3 blocks deep and heals on its
+    own before finality walls or lost work ever come into it.
+    """
+    while True:
+        time.sleep(60)
+        try:
+            with node.lock:
+                h = len(node.chain.chain)
+                probe = h - 30
+                if probe < 1 or not node.peers:
+                    node.split_detected = False
+                    continue
+                my_hash = node.chain.chain[probe].compute_hash()
+            agree = 0
+            disagree = 0
+            for p in list(node.peers)[:6]:
+                data = get_json(p.rstrip("/") + "/chain?from=%d&count=1" % probe,
+                                timeout=6)
+                if isinstance(data, list) and data and isinstance(data[0], dict):
+                    theirs = data[0].get("hash")
+                    if not theirs:
+                        try:
+                            theirs = bc_block_from_dict_hash(data[0])
+                        except Exception:
+                            theirs = None
+                    if theirs is None:
+                        continue
+                    if theirs == my_hash:
+                        agree += 1
+                    else:
+                        disagree += 1
+            was = getattr(node, "split_detected", False)
+            now_split = disagree > agree and disagree >= 2
+            node.split_detected = now_split
+            if now_split and not was:
+                add_event(node, "WARNING: chain split detected -- this node's "
+                                "history disagrees with the network. If this "
+                                "persists, reset chain data to rejoin.")
+        except Exception:
+            pass
+
+
+def bc_block_from_dict_hash(d):
+    """Recompute a block dict's hash (/chain payloads don't carry one)."""
+    b = Block(d["index"], d["transactions"], d["previous_hash"],
+              d["timestamp"], d["nonce"])
+    return b.compute_hash()
+
+
 def mining_loop(node):
     node.mine_stats = {"start": time.time(), "earned": 0.0, "blocks": 0}
     last_tick = time.time()
@@ -5464,6 +5564,7 @@ def main():
     threading.Thread(target=auto_sync_loop, args=(node,), daemon=True).start()
     threading.Thread(target=rebroadcast_transfers, args=(node,), daemon=True).start()
     threading.Thread(target=pull_pending_transfers, args=(node,), daemon=True).start()
+    threading.Thread(target=split_detect_loop, args=(node,), daemon=True).start()
     threading.Thread(target=share_pull_loop, args=(node,), daemon=True).start()
     threading.Thread(target=mining_watchdog, args=(node,), daemon=True).start()
     if "--isolated" not in sys.argv:      # test mode: no LAN discovery -> stays sealed off

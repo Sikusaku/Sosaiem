@@ -209,6 +209,9 @@ tr.hrow{cursor:pointer} tr.hrow:hover td{background:#16302a}
   </aside>
 
   <main class="content">
+    <div id="split-banner" style="display:none;background:#4a1f1f;border:1px solid #8a3535;color:#f0b9b9;padding:10px 16px;font-size:13px;text-align:center">
+      &#9888; <b>Chain split detected</b> &mdash; this node's history disagrees with the network. If this stays for more than a few minutes, close the app, delete <span class="mono">chain_*.json</span> (keep <span class="mono">wallet_*.pem</span>!) and reopen to rejoin.
+    </div>
     <div class="topbar">
       <div>
         <div class="lbl">YOUR BALANCE</div>
@@ -447,6 +450,8 @@ async function tick(){
   if(!document.getElementById('payout').value) document.getElementById('payout').value = ADDR;
 
   MINING = d.mining;
+  const sb=document.getElementById('split-banner');
+  if(sb) sb.style.display = d.split_warning ? 'block' : 'none';
   // set up the thread slider once, from the node's real CPU count
   if(!window._thrInit && d.cpu_count){
     window._thrInit = true;
