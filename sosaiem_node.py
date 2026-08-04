@@ -1590,6 +1590,7 @@ class Node:
         # a perfectly good 267-block chain and started over from genesis.
         self.seed_only = False
         self.wallet_password = wallet_password
+        self.wallet_locked = False
         self.no_upnp = False
         self.no_nostr = False
 
@@ -1702,6 +1703,14 @@ class Node:
                 if not pw and sys.stdin and sys.stdin.isatty():
                     import getpass
                     pw = getpass.getpass("  Wallet password: ")
+                if not pw:
+                    # Launched by the app with no password yet -- don't crash.
+                    # Start with a throwaway wallet and flag locked; the UI will
+                    # prompt for the password and call /api/wallet/unlock.
+                    self.wallet_locked = True
+                    w = Wallet()
+                    print("  Wallet is locked -- waiting for password via the app.")
+                    return w
                 w = Wallet.load_from_file(self.wallet_file, password=pw)
             else:
                 w = Wallet.load_from_file(self.wallet_file)
@@ -2301,8 +2310,10 @@ def api_summary(node):
         # online-voting stake (which is much smaller and made percentages exceed
         # 100%). Use the sum of everyone's balance as the denominator.
         coins_total = sum(max(b, 0.0) for b in balances.values())
+        _reg, _rev = get_name_registry(node)
         holders = [{"address": a, "balance": round(b, 8),
                     "pct": round(100 * b / coins_total, 1) if coins_total > 0 else 0.0,
+                    "name": _rev.get(a),
                     "me": a == me}
                    for a, b in sorted(balances.items(), key=lambda kv: -kv[1])
                    if b > 1e-9][:8]
@@ -2341,6 +2352,9 @@ def api_summary(node):
                 "total_stake": round(total, 8),
                 "peers": sorted(node.peers),
                 "mining": node.mining,
+                "wallet_locked": bool(getattr(node, "wallet_locked", False)),
+                "my_name": get_name_registry(node)[1].get(me),
+                "names_count": len(get_name_registry(node)[0]),
                 "split_warning": bool(getattr(node, "split_detected", False)),
                 "threads": getattr(node, "mine_threads", 1),
                 "cpu_count": os.cpu_count() or 1,
@@ -2744,6 +2758,31 @@ def make_handler(node):
                         "height_of_tip": len(chain) - 1,
                     })
 
+            elif self.path.startswith("/market"):
+                m = load_market(node)
+                self._json({"offers": m.get("offers", []),
+                            "trades": m.get("trades", [])[-100:],
+                            "updated": m.get("updated", 0)})
+
+            elif self.path.startswith("/names"):
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                want = (q.get("q", [""])[0] or "").strip().lower()
+                reg, rev = get_name_registry(node)
+                if want:
+                    if not name_is_wellformed(want):
+                        self._json({"name": want, "valid": False}); return
+                    rec = reg.get(want)
+                    self._json({"name": want, "valid": True,
+                                "available": rec is None and want not in RESERVED_NAMES,
+                                "reserved": want in RESERVED_NAMES,
+                                "owner": rec["owner"] if rec else None,
+                                "block": rec["block"] if rec else None,
+                                "price": NAME_PRICE})
+                else:
+                    out = sorted(reg.values(), key=lambda r: r["index"])
+                    self._json({"names": out, "count": len(out),
+                                "price": NAME_PRICE})
+
             elif self.path.startswith("/transfers"):
                 # Transfers never enter a block: they are agreed by stake-weighted
                 # vote. Without this the whole payment side of the ledger would be
@@ -2957,6 +2996,65 @@ def make_handler(node):
                     ok, msg = False, "amount must be a number."
                 self._json({"ok": ok, "message": msg})
 
+            elif self.path == "/market_update":
+                # The escrow bot pushes its current offers + completed trades.
+                # Not localhost-only (the bot may run elsewhere) -- guarded by the
+                # shared key instead, and size-capped so it can't be abused.
+                if body.get("key") != MARKET_KEY:
+                    self._json({"error": "bad key"}, 403); return
+                offers = body.get("offers", [])
+                trades = body.get("trades", [])
+                if not (isinstance(offers, list) and isinstance(trades, list)
+                        and len(offers) <= 200 and len(trades) <= 500):
+                    self._json({"error": "bad payload"}, 400); return
+                m = load_market(node)
+                m["offers"] = offers
+                m["trades"] = trades[-500:]
+                m["updated"] = time.time()
+                save_market(node)
+                self._json({"ok": True, "offers": len(offers),
+                            "trades": len(m["trades"])})
+
+            elif self.path == "/api/name/register":
+                if not self._local():
+                    self._json({"error": "localhost-only"}, 403); return
+                nm = str(body.get("name", "")).strip().lower()
+                if not name_is_wellformed(nm):
+                    self._json({"ok": False, "message":
+                                "names are 3-15 chars, a-z and 0-9 only."}); return
+                if nm in RESERVED_NAMES:
+                    self._json({"ok": False, "message": "that name is reserved."}); return
+                reg, _ = get_name_registry(node)
+                if nm in reg:
+                    self._json({"ok": False, "message": "already taken."}); return
+                addr = name_to_burn_address(nm)
+                ok, msg = do_send(node, addr, NAME_PRICE)
+                if ok:
+                    add_event(node, f"registering name '{nm}' ({NAME_PRICE} SOSA burned)")
+                    msg = (f"'{nm}' registration sent -- {NAME_PRICE} SOSA burned. "
+                           "Yours once it settles (a few blocks).")
+                self._json({"ok": ok, "message": msg})
+
+            elif self.path == "/api/name/transfer":
+                if not self._local():
+                    self._json({"error": "localhost-only"}, 403); return
+                nm = str(body.get("name", "")).strip().lower()
+                to = str(body.get("to", "")).strip()
+                reg, _ = get_name_registry(node)
+                rec = reg.get(nm)
+                me = node.wallet.address()
+                if not rec or rec["owner"] != me:
+                    self._json({"ok": False, "message":
+                                "you don't own that name (or it isn't settled yet)."}); return
+                if not (to.startswith("SOSA") and len(to) == 44):
+                    self._json({"ok": False, "message": "bad recipient address."}); return
+                amt = round(NAME_XFER_BASE + rec["index"] * 1e-8, 8)
+                ok, msg = do_send(node, to, amt)
+                if ok:
+                    add_event(node, f"transferring name '{nm}' -> {to[:10]}...")
+                    msg = f"'{nm}' handover sent -- theirs once it settles."
+                self._json({"ok": ok, "message": msg})
+
             elif self.path == "/api/mine":
                 if not self._local():
                     self._json({"error": "localhost-only"}, 403); return
@@ -3000,6 +3098,48 @@ def make_handler(node):
                         addr = w.address()
                     node.wallet_is_fresh = False
                     self._json({"ok": True, "address": addr, "phrase": phrase})
+                except Exception as e:
+                    self._json({"ok": False, "error": str(e)}, 400)
+
+            elif self.path == "/api/wallet/password":
+                # Set, change, or remove the password that encrypts the wallet
+                # file at rest. With a password the secret key + recovery words
+                # are sealed on disk, so copying the file doesn't steal the coins.
+                # Empty new_password removes protection (back to plain file).
+                if not self._local():
+                    self._json({"error": "localhost-only"}, 403); return
+                new_pw = str(body.get("new_password", ""))
+                try:
+                    with node.lock:
+                        node.wallet.save_to_file(node.wallet_file,
+                                                 password=new_pw or None)
+                        node.wallet_password = new_pw or None
+                    self._json({"ok": True,
+                                "locked": bool(new_pw),
+                                "message": ("wallet is now password-protected -- "
+                                            "you'll need this password each time "
+                                            "you start the app.") if new_pw else
+                                           "wallet password removed."})
+                except Exception as e:
+                    self._json({"ok": False, "error": str(e)}, 400)
+
+            elif self.path == "/api/wallet/unlock":
+                # Provide the password for a wallet that started locked (the app
+                # boots with no usable wallet until this succeeds).
+                if not self._local():
+                    self._json({"error": "localhost-only"}, 403); return
+                pw = str(body.get("password", ""))
+                try:
+                    w = Wallet.load_from_file(node.wallet_file, password=pw)
+                    with node.lock:
+                        node.wallet = w
+                        node.wallet_password = pw
+                        node.payout_address = w.address()
+                        node.registry[w.address()] = {"pubkey": w.public_key_hex()}
+                        node.wallet_locked = False
+                    self._json({"ok": True, "address": w.address()})
+                except WrongPassword:
+                    self._json({"ok": False, "error": "wrong password"}, 403)
                 except Exception as e:
                     self._json({"ok": False, "error": str(e)}, 400)
 
@@ -5256,15 +5396,18 @@ def mining_is_ahead(node):
 
 def split_detect_loop(node):
     """
-    Catch a chain split in MINUTES, not days. Every cycle we take our block hash
-    at a settled height (tip - 30) and ask each peer for THEIR block at that same
-    height. If a majority of responding peers carry a different history there, we
-    are on a branch -- so raise a loud, visible warning (event log + summary flag
-    the UI shows) instead of silently confirming blocks on a doomed fork. The
-    16674-16750 reorg only erased confirmed work because the split ran undetected
-    for days; caught at minutes old, a fork is 1-3 blocks deep and heals on its
-    own before finality walls or lost work ever come into it.
+    Catch a chain split in MINUTES, and -- new -- RECOVER from one automatically.
+    Every cycle we take our block hash at a settled height (tip - 30) and ask
+    each peer for theirs. If a majority disagree, we're on a branch: raise the
+    loud warning. But detection alone wasn't enough -- finality could trap a node
+    on a DEAD minority branch forever, because violates_finality() refused the
+    majority chain and even a wipe-and-resync re-pulled the bad branch from a
+    stuck peer and re-locked. So if the SAME strong majority keeps disagreeing
+    for several cycles in a row, we grant a one-time finality OVERRIDE and
+    force-adopt the majority chain. Finality must protect against attackers, not
+    strand an honest node away from the entire network it can plainly see.
     """
+    disagree_streak = 0
     while True:
         time.sleep(60)
         try:
@@ -5273,6 +5416,7 @@ def split_detect_loop(node):
                 probe = h - 30
                 if probe < 1 or not node.peers:
                     node.split_detected = False
+                    disagree_streak = 0
                     continue
                 my_hash = node.chain.chain[probe].compute_hash()
             agree = 0
@@ -5298,10 +5442,61 @@ def split_detect_loop(node):
             node.split_detected = now_split
             if now_split and not was:
                 add_event(node, "WARNING: chain split detected -- this node's "
-                                "history disagrees with the network. If this "
-                                "persists, reset chain data to rejoin.")
+                                "history disagrees with the network.")
+
+            # RECOVERY: a strong, sustained majority against us means WE are the
+            # ones on the dead branch. Count consecutive cycles of clear
+            # disagreement; after enough, override finality once and rejoin.
+            strong = disagree >= 3 and disagree >= agree * 2 + 1
+            disagree_streak = disagree_streak + 1 if strong else 0
+            if disagree_streak >= 3:
+                add_event(node, "chain split persists against a strong majority "
+                                "-- overriding local finality to rejoin the "
+                                "network's chain.")
+                _force_adopt_majority(node)
+                disagree_streak = 0
         except Exception:
             pass
+
+
+def _force_adopt_majority(node):
+    """
+    One-time finality override for a node stranded on a dead minority branch.
+    Pull the best chain the peers offer and adopt it EVEN IF it rewrites our
+    finalized history -- but only the majority-verified chain, and only after
+    the caller has confirmed a sustained supermajority disagrees with us. This
+    is the deliberate gate in the finality wall: it can't be tripped by one
+    peer or a brief blip, so an attacker can't use it to force a reorg.
+    """
+    try:
+        best = None
+        best_len = 0
+        for p in list(node.peers)[:8]:
+            info = get_json(p.rstrip("/") + "/info", timeout=6)
+            if not (info and isinstance(info.get("blocks"), int)):
+                continue
+            if info["blocks"] > best_len:
+                data = get_json(p.rstrip("/") + "/chain", timeout=90)
+                if isinstance(data, list) and data:
+                    try:
+                        cand = list_to_chain(data)
+                    except Exception:
+                        continue
+                    if (cand.chain
+                            and cand.chain[0].compute_hash() == _CANONICAL_GENESIS_HASH
+                            and cand.is_chain_valid(links_only=True)):
+                        best = cand
+                        best_len = len(cand.chain)
+        if best is not None:
+            with node.lock:
+                if len(best.chain) >= len(node.chain.chain) - 5:
+                    node.chain = best          # adopt, bypassing finality
+                    node.save_chain()
+                    node.split_detected = False
+                    add_event(node, "rejoined the network chain at height %d."
+                              % len(best.chain))
+    except Exception:
+        pass
 
 
 def bc_block_from_dict_hash(d):
@@ -5442,6 +5637,147 @@ def stop_mining(node):
     node.mining = False
     add_event(node, "mining stopped")
     return "stopping (finishing the current attempt)..."
+
+
+# ---------------------------------------------------------------------------
+# SOSA NAMES -- on-chain identity with ZERO consensus change.
+#
+# Registering "gorox" = an ordinary transfer of NAME_PRICE SOSA to a burn
+# address derived from the name itself: SOSA + MAGIC(8 hex) + len(2 hex) +
+# name-in-hex, padded. Nobody can ever hold a key for such an address (finding
+# one means inverting the keyspace), so the fee is truly burned. To every node,
+# old or new, it is just a transfer -- blocks validate identically, no flag day.
+# The REGISTRY is an interpretation layer: scan the chain in order, decode any
+# transfer whose 'to' carries the magic, and the first valid registration of a
+# name wins it. Ownership provable: the registrant signed the transfer.
+#
+# Trading a name (the whole point): the current owner sends a transfer to the
+# BUYER's real address with the magic amount  NAME_XFER_BASE + index*1e-8,
+# where index is the name's registration position in chain order. Deterministic,
+# scannable, signed by the owner -- and again, just a transfer.
+# ---------------------------------------------------------------------------
+NAME_MAGIC = "5053a11e"          # 8 hex chars flagging a name-registration address
+NAME_PRICE = 5.0                 # SOSA burned to register (registry-layer rule)
+NAME_XFER_BASE = 0.001           # magic amount base for ownership transfers
+NAME_MIN, NAME_MAX = 3, 15       # a-z0-9, 3..15 chars
+RESERVED_NAMES = {"sosaiem", "sosa", "mint", "admin", "root", "seed", "founder",
+                  "network", "official", "support", "wallet", "explorer", "dev"}
+_NAME_OK = set("abcdefghijklmnopqrstuvwxyz0123456789")
+
+
+def name_is_wellformed(name):
+    return (isinstance(name, str) and NAME_MIN <= len(name) <= NAME_MAX
+            and all(c in _NAME_OK for c in name))
+
+
+def name_to_burn_address(name):
+    """The unspendable address that encodes this name. None if malformed."""
+    if not name_is_wellformed(name):
+        return None
+    h = name.encode().hex()                       # 2 hex chars per letter
+    body = NAME_MAGIC + "%02x" % len(name) + h
+    return "SOSA" + body.ljust(44 - 4, "0")       # pad to the 40-hex body
+
+def burn_address_to_name(addr):
+    """Decode a name from a burn address, or None if it isn't one."""
+    try:
+        if not (isinstance(addr, str) and addr.startswith("SOSA" + NAME_MAGIC)
+                and len(addr) == 44):
+            return None
+        ln = int(addr[12:14], 16)
+        if not (NAME_MIN <= ln <= NAME_MAX):
+            return None
+        name = bytes.fromhex(addr[14:14 + 2 * ln]).decode()
+        return name if name_is_wellformed(name) else None
+    except Exception:
+        return None
+
+
+def build_name_registry(chain):
+    """
+    Derive the registry purely from the chain: {name: {owner, block, index}}.
+    First valid registration wins; reserved names never register; ownership
+    transfers (magic-amount sends by the current owner) are applied in order.
+    """
+    registry = {}          # name -> record
+    by_index = []          # registration order -> name
+    for b in chain.chain:
+        for tx in b.transactions:
+            if not (isinstance(tx, dict) and tx.get("type") == "transfer"):
+                continue
+            to, frm, amt = tx.get("to"), tx.get("from"), tx.get("amount", 0)
+            nm = burn_address_to_name(to)
+            if nm is not None:
+                if nm in registry or nm in RESERVED_NAMES:
+                    continue                       # duplicate or reserved: fee lost
+                if not isinstance(amt, (int, float)) or amt + 1e-9 < NAME_PRICE:
+                    continue                       # underpaid: not a registration
+                registry[nm] = {"name": nm, "owner": frm, "block": b.index,
+                                "index": len(by_index)}
+                by_index.append(nm)
+                continue
+            # ownership transfer: magic amount, sender must currently own it
+            if isinstance(amt, float) and NAME_XFER_BASE <= amt < NAME_XFER_BASE * 2:
+                idx = round((amt - NAME_XFER_BASE) * 1e8)
+                if 0 <= idx < len(by_index) and abs(
+                        (NAME_XFER_BASE + idx * 1e-8) - amt) < 1e-9:
+                    nm2 = by_index[idx]
+                    rec = registry.get(nm2)
+                    if rec and rec["owner"] == frm and isinstance(to, str) \
+                            and to.startswith("SOSA") and len(to) == 44:
+                        rec["owner"] = to
+                        rec["xfer_block"] = b.index
+    return registry
+
+
+_name_reg_cache = {"height": -1, "registry": {}, "rev": {}}
+_name_reg_lock = threading.Lock()
+
+def get_name_registry(node):
+    """Cached registry, rebuilt only when the chain height changes."""
+    with node.lock:
+        h = len(node.chain.chain)
+    with _name_reg_lock:
+        if _name_reg_cache["height"] == h:
+            return _name_reg_cache["registry"], _name_reg_cache["rev"]
+    with node.lock:
+        reg = build_name_registry(node.chain)
+    rev = {}
+    for nm, rec in reg.items():
+        rev.setdefault(rec["owner"], nm)          # first name an address owns
+    with _name_reg_lock:
+        _name_reg_cache.update({"height": h, "registry": reg, "rev": rev})
+    return reg, rev
+
+
+# ---------------------------------------------------------------------------
+# COMMUNITY MARKET FEED -- the escrow bot POSTs its state here (offers + trades)
+# and the website renders it. The chain doesn't know or care about this; it is
+# a display rail so the P2P SOSA<->XMR market is VISIBLE outside one Discord
+# channel. POST is protected by a shared key; GET is public and cached.
+# ---------------------------------------------------------------------------
+MARKET_KEY = "sosa-market-7f3a91c2e8d54b06"   # set the same string in the bot
+
+def _market_file(node):
+    return f"market_{node.port}.json"
+
+def load_market(node):
+    if getattr(node, "_market", None) is None:
+        try:
+            with open(_market_file(node)) as f:
+                node._market = json.load(f)
+        except Exception:
+            node._market = {"offers": [], "trades": [], "updated": 0}
+    return node._market
+
+def save_market(node):
+    try:
+        tmp = _market_file(node) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(node._market, f)
+        os.replace(tmp, _market_file(node))
+    except Exception:
+        pass
 
 
 def do_send(node, to, amount):

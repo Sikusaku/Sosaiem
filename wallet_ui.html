@@ -202,6 +202,7 @@ tr.hrow{cursor:pointer} tr.hrow:hover td{background:#16302a}
       <button class="on" data-p="mine" onclick="go('mine',this)"><span class="ic">&#9874;</span>Mine</button>
       <button data-p="send" onclick="go('send',this)"><span class="ic">&#8599;</span>Send</button>
       <button data-p="explorer" onclick="go('explorer',this)"><span class="ic">&#9638;</span>Explorer</button>
+      <button data-p="names" onclick="go('names',this)"><span class="ic">&#9733;</span>Names</button>
       <button data-p="node" onclick="go('node',this)"><span class="ic">&#9737;</span>Node</button>
     </nav>
     <div class="foot"><span class="dot" id="netdot"></span><span id="netstate">connecting&hellip;</span><br>
@@ -209,6 +210,15 @@ tr.hrow{cursor:pointer} tr.hrow:hover td{background:#16302a}
   </aside>
 
   <main class="content">
+    <div id="unlock-overlay" style="display:none;position:fixed;inset:0;background:#0c1512;z-index:9999;align-items:center;justify-content:center">
+      <div style="max-width:360px;text-align:center;padding:24px">
+        <h2 style="color:var(--gilt)">Wallet locked</h2>
+        <p class="sub">Enter your password to unlock this wallet.</p>
+        <input class="f" id="unlock-pw" type="password" placeholder="password" style="text-align:center;margin:12px 0" onkeydown="if(event.key==='Enter')doUnlock()">
+        <button class="btn" onclick="doUnlock()">Unlock</button>
+        <div class="msg err" id="unlock-msg"></div>
+      </div>
+    </div>
     <div id="split-banner" style="display:none;background:#4a1f1f;border:1px solid #8a3535;color:#f0b9b9;padding:10px 16px;font-size:13px;text-align:center">
       &#9888; <b>Chain split detected</b> &mdash; this node's history disagrees with the network. If this stays for more than a few minutes, close the app, delete <span class="mono">chain_*.json</span> (keep <span class="mono">wallet_*.pem</span>!) and reopen to rejoin.
     </div>
@@ -312,6 +322,40 @@ tr.hrow{cursor:pointer} tr.hrow:hover td{background:#16302a}
       </div>
     </div>
 
+    <!-- NAMES -->
+    <section class="page" id="page-names">
+      <div class="card">
+        <h3>SOSA Names</h3>
+        <p class="sub">Own a name on the chain. <b>5 SOSA</b>, burned forever &mdash; register once, yours for life, tradeable. Everywhere your address appears, your name shows instead.</p>
+        <div style="display:flex;gap:10px">
+          <input class="f" id="nm-q" placeholder="pick a name (3-15 chars, a-z 0-9)" style="flex:1" oninput="nmCheck()">
+          <button class="btn" id="nm-btn" style="width:auto;padding:0 22px" onclick="nmRegister()" disabled>Register</button>
+        </div>
+        <div class="msg dim" id="nm-msg">type a name to check availability</div>
+      </div>
+      <div class="card">
+        <h3>Wallet password</h3>
+        <p class="sub">Encrypt your wallet file so a copy of it is useless without your password. You'll enter it each time the app starts. Leave blank and save to remove protection.</p>
+        <input class="f" id="wpw" type="password" placeholder="new password (blank = none)" style="margin-bottom:8px">
+        <button class="btn" style="width:auto;padding:0 22px" onclick="setWalletPw()">Save password</button>
+        <div class="msg dim" id="wpw-msg"></div>
+      </div>
+
+      <div class="card" id="nm-mine-card" style="display:none">
+        <h3>Your names</h3>
+        <div id="nm-mine"></div>
+        <div style="display:flex;gap:10px;margin-top:10px">
+          <input class="f" id="nm-xfer-to" placeholder="SOSA... (buyer's address)" style="flex:1">
+          <button class="btn" style="width:auto;padding:0 18px" onclick="nmXfer()">Send name</button>
+        </div>
+        <div class="msg dim" id="nm-xfer-msg">sell a name: agree the price in escrow, then hand it over here</div>
+      </div>
+      <div class="card">
+        <h3>The register</h3>
+        <div id="nm-all" class="mono" style="font-size:12.5px;color:var(--dim)">&mdash;</div>
+      </div>
+    </section>
+
     <!-- NODE -->
     <section class="page" id="page-node">
       <div class="card">
@@ -395,6 +439,68 @@ async function swapWallet(){
     else { msg.style.color='#e0a3a3'; msg.textContent=(r&&r.error)||'could not import those words.'; }
   }catch(e){ msg.style.color='#e0a3a3'; msg.textContent='import failed.'; }
 }
+let NM_SEL = null;
+async function setWalletPw(){
+  const pw=document.getElementById('wpw').value;
+  const m=document.getElementById('wpw-msg');
+  if(pw && pw.length<4){m.className='msg err';m.textContent='use at least 4 characters';return;}
+  if(pw && !confirm('Set this wallet password? If you forget it, only your 17 recovery words can restore the wallet.'))return;
+  const r=await api('/api/wallet/password',{new_password:pw});
+  m.className=r.ok?'msg ok':'msg err';m.textContent=r.message||r.error;
+  if(r.ok)document.getElementById('wpw').value='';
+}
+async function doUnlock(){
+  const pw=document.getElementById('unlock-pw').value;
+  const m=document.getElementById('unlock-msg');
+  const r=await api('/api/wallet/unlock',{password:pw});
+  if(r.ok){document.getElementById('unlock-overlay').style.display='none';m.textContent='';poll();}
+  else{m.textContent=r.error||'wrong password';}
+}
+async function nmCheck(){
+  const q=document.getElementById('nm-q').value.trim().toLowerCase();
+  const msg=document.getElementById('nm-msg'), btn=document.getElementById('nm-btn');
+  btn.disabled=true;
+  if(q.length<3){msg.className='msg dim';msg.textContent='type a name to check availability';return;}
+  try{
+    const r=await (await fetch('/names?q='+encodeURIComponent(q))).json();
+    if(!r.valid){msg.className='msg err';msg.textContent='3-15 chars, a-z and 0-9 only';return;}
+    if(r.reserved){msg.className='msg err';msg.textContent='"'+q+'" is reserved';return;}
+    if(!r.available){msg.className='msg err';msg.textContent='"'+q+'" is taken (owner '+(r.owner||'').slice(0,10)+'\u2026)';return;}
+    msg.className='msg ok';msg.textContent='"'+q+'" is available \u2014 '+r.price+' SOSA, burned';btn.disabled=false;
+  }catch(e){msg.className='msg err';msg.textContent='could not check';}
+}
+async function nmRegister(){
+  const q=document.getElementById('nm-q').value.trim().toLowerCase();
+  const msg=document.getElementById('nm-msg');
+  if(!confirm('Register "'+q+'" for 5 SOSA? The fee is burned forever.'))return;
+  const r=await api('/api/name/register',{name:q});
+  msg.className=r.ok?'msg ok':'msg err';msg.textContent=r.message;
+  if(r.ok){document.getElementById('nm-q').value='';document.getElementById('nm-btn').disabled=true;}
+  nmLoad();
+}
+async function nmXfer(){
+  if(!NM_SEL){document.getElementById('nm-xfer-msg').textContent='click one of your names first';return;}
+  const to=document.getElementById('nm-xfer-to').value.trim();
+  const m=document.getElementById('nm-xfer-msg');
+  if(!confirm('Hand "'+NM_SEL+'" over to '+to.slice(0,14)+'\u2026? This is permanent once settled.'))return;
+  const r=await api('/api/name/transfer',{name:NM_SEL,to});
+  m.className=r.ok?'msg ok':'msg err';m.textContent=r.message;
+  if(r.ok){NM_SEL=null;document.getElementById('nm-xfer-to').value='';}
+  nmLoad();
+}
+async function nmLoad(){
+  try{
+    const r=await (await fetch('/names')).json();
+    const mine=(r.names||[]).filter(n=>n.owner===ADDR);
+    const mc=document.getElementById('nm-mine-card');
+    if(mine.length){mc.style.display='';
+      document.getElementById('nm-mine').innerHTML=mine.map(n=>'<span onclick="NM_SEL=\''+n.name+'\';this.parentNode.querySelectorAll(\'span\').forEach(s=>s.style.borderColor=\'#24463d\');this.style.borderColor=\'var(--gilt)\'" style="display:inline-block;cursor:pointer;border:1px solid #24463d;border-radius:8px;padding:6px 12px;margin:3px;font-weight:bold">'+n.name+'.sosa</span>').join('');
+    } else mc.style.display='none';
+    document.getElementById('nm-all').innerHTML=(r.names||[]).length?
+      (r.names||[]).map(n=>n.name+'.sosa &mdash; '+(n.owner===ADDR?'<b>you</b>':n.owner.slice(0,12)+'\u2026')+' (block '+n.block+')').join('<br>')
+      : 'no names registered yet \u2014 be first';
+  }catch(e){}
+}
 function enterApp(){
   document.getElementById('onboard').style.display='none';
   document.getElementById('app').style.display='block';
@@ -407,6 +513,7 @@ function go(page, el){
   el.classList.add('on');
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('on'));
   document.getElementById('page-'+page).classList.add('on');
+  if(page==='names') nmLoad();
 }
 
 // ---------- actions ----------
@@ -450,6 +557,8 @@ async function tick(){
   if(!document.getElementById('payout').value) document.getElementById('payout').value = ADDR;
 
   MINING = d.mining;
+  const uo=document.getElementById('unlock-overlay');
+  if(uo) uo.style.display = d.wallet_locked ? 'flex' : 'none';
   const sb=document.getElementById('split-banner');
   if(sb) sb.style.display = d.split_warning ? 'block' : 'none';
   // set up the thread slider once, from the node's real CPU count
