@@ -1061,6 +1061,11 @@ def get_lan_ip():
 
 _chain_cache = {"tip": None, "body": b"[]"}
 _chain_cache_lock = threading.Lock()
+# At most this many workers may verify share-chain shares at once. Share
+# verification is expensive and miners POST nonstop -- with no cap, ALL http
+# workers sat in handle_incoming_schain_share forever and /info (and the Mint)
+# starved. Rejected extras just re-gossip; nothing is lost.
+_schain_gate = threading.BoundedSemaphore(2)
 
 
 def _cached_chain_payload(node):
@@ -3261,7 +3266,13 @@ def make_handler(node):
                 self._json({"result": handle_incoming_share(node, body)})
 
             elif self.path == "/schain_share":
-                self._json({"result": handle_incoming_schain_share(node, body)})
+                if _schain_gate.acquire(blocking=False):
+                    try:
+                        self._json({"result": handle_incoming_schain_share(node, body)})
+                    finally:
+                        _schain_gate.release()
+                else:
+                    self._json({"result": "busy"})
 
             elif self.path == "/vote":
                 self._json({"result": handle_incoming_vote(node, body)})
@@ -3364,6 +3375,18 @@ def handle_incoming_share(node, s):
                 bucket = node.recent_shares[prev_hash].setdefault(addr, set())
                 if len(bucket) < MAX_SHARES_PER_BLOCK:
                     bucket.add(nonce)
+            else:
+                # A share against a tip this seed does NOT know is usually from
+                # a miner AHEAD of us -- the seed lags the true tip whenever it
+                # is busy, and home miners mine the newest block. Dropping these
+                # silently erased every home miner's work the moment the seed
+                # ran even one block behind, which is why pull-only miners never
+                # appeared in any block's share list. Keep them under their tip
+                # (bounded) so pulling miners can collect and pay this work.
+                if len(node.recent_shares) < 4 * SHARE_WINDOW:
+                    bucket = node.recent_shares.setdefault(prev_hash, {}).setdefault(addr, set())
+                    if len(bucket) < MAX_SHARES_PER_BLOCK:
+                        bucket.add(nonce)
         gossip(node, "/share", s)
         return "relayed"
 
@@ -5525,7 +5548,12 @@ def split_detect_loop(node):
             # RECOVERY: a strong, sustained majority against us means WE are the
             # ones on the dead branch. Count consecutive cycles of clear
             # disagreement; after enough, override finality once and rejoin.
-            strong = disagree >= 3 and disagree >= agree * 2 + 1
+            # Scale the bar to how many peers actually answered: a home
+            # node may only ever reach 2 peers, and a flat ">= 3" meant the
+            # rescue could never fire for exactly the nodes that island most.
+            responders = agree + disagree
+            strong = (responders >= 2 and disagree >= agree * 2 + 1
+                      and disagree >= min(3, responders))
             disagree_streak = disagree_streak + 1 if strong else 0
             if disagree_streak >= 3:
                 add_event(node, "chain split persists against a strong majority "
@@ -5567,7 +5595,12 @@ def _force_adopt_majority(node):
                         best_len = len(cand.chain)
         if best is not None:
             with node.lock:
-                if len(best.chain) >= len(node.chain.chain) - 5:
+                # An islanded miner keeps mining, so its island is often
+                # MORE than 5 blocks longer than the real chain -- the old "-5"
+                # gate then refused the rescue it had just fetched. Within
+                # FINALITY_DEPTH is enough: the sustained supermajority above is
+                # the real guard.
+                if len(best.chain) >= len(node.chain.chain) - FINALITY_DEPTH:
                     node.chain = best          # adopt, bypassing finality
                     node.save_chain()
                     node.split_detected = False
