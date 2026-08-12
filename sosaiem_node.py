@@ -31,6 +31,7 @@ class ThreadingHTTPServer(_BaseHTTPServer):
     # the port for a minute or two and reopening the wallet fails to start.
     allow_reuse_address = True
     daemon_threads = True
+    request_queue_size = 128
 
     # A public node gets hammered by random internet traffic. Spawning one
     # unbounded thread per request piled up until the OS refused new threads
@@ -54,6 +55,10 @@ class ThreadingHTTPServer(_BaseHTTPServer):
 
     def _handle_pooled(self, request, client_address):
         try:
+            try:
+                request.settimeout(5)
+            except Exception:
+                pass
             self.finish_request(request, client_address)
         except Exception:
             pass
@@ -1066,12 +1071,19 @@ def _cached_chain_payload(node):
     node serves. Encoding it per request -- while holding the node's main lock
     -- was enough on its own to make a busy seed stop answering.
     """
+    # Read the tip and grab block references under the lock, then release it
+    # BEFORE the expensive encode. Holding node.lock through json.dumps of the
+    # whole chain froze every other request (including fast ranged sync pulls)
+    # for the full encode time every time a block arrived.
     with node.lock:
         tip = node.chain.last_block.compute_hash()
         need = _chain_cache["tip"] != tip
-        blocks = chain_to_list(node.chain) if need else None
+        block_refs = list(node.chain.chain) if need else None
     if not need:
         return _chain_cache["body"]
+    blocks = [{"index": b.index, "timestamp": b.timestamp,
+               "transactions": b.transactions, "previous_hash": b.previous_hash,
+               "nonce": b.nonce} for b in block_refs]
     body = json.dumps(blocks).encode()
     with _chain_cache_lock:
         _chain_cache["tip"] = tip
@@ -1818,7 +1830,7 @@ class Node:
                           f"check on this build. Keeping the chain.")
                     return
                 _remember_verified(bid)
-                time.sleep(0.25)      # never take priority over mining
+                time.sleep(0.01)      # small yield; was 0.25 which stalled catch-up
             self._save_verified()
         except Exception:
             pass
@@ -2450,6 +2462,13 @@ poll();setInterval(poll,2000);
 
 def make_handler(node):
     class H(BaseHTTPRequestHandler):
+        timeout = 20
+        def setup(self):
+            super().setup()
+            try:
+                self.connection.settimeout(20)
+            except Exception:
+                pass
         def _json(self, obj, code=200):
             try:
                 body = json.dumps(obj).encode()
@@ -2591,11 +2610,18 @@ def make_handler(node):
                             limit = max(1, int(cnt))
                         except ValueError:
                             limit = None
+                    # Grab just the block references under the lock, then build
+                    # the dicts OUTSIDE it. Serializing while holding node.lock
+                    # meant a busy (mining) seed made every chain request wait for
+                    # the lock -- turning a 57KB batch into a 26-second transfer
+                    # and stalling syncing peers at the tip. Copy fast, serialize
+                    # free.
                     with node.lock:
                         if limit is not None:
-                            part = [block_to_dict(b) for b in node.chain.chain[n:n + limit]]
+                            blocks = list(node.chain.chain[n:n + limit])
                         else:
-                            part = [block_to_dict(b) for b in node.chain.chain[n:]]
+                            blocks = list(node.chain.chain[n:])
+                    part = [block_to_dict(b) for b in blocks]
                     self._json(part)
                 else:
                     # Full-chain download is the heavy one -- gate it so a burst of
@@ -2839,8 +2865,26 @@ def make_handler(node):
                         })
                         if len(out) >= (1 if sig_want else limit):
                             break
-                    pending = [dict(t) for s, t in node.transfers.items()
-                               if s not in node.confirmed][:20]
+                    # Only show pending transfers a miner could actually include:
+                    # walk them oldest-first against a scratch copy of balances and
+                    # drop anything the sender can no longer afford (duplicate
+                    # spam-clicks past the sender's balance sat here forever and
+                    # made the Mint scream "stuck" about corpses).
+                    raw_pending = [t for s2, t in node.transfers.items()
+                                   if s2 not in node.confirmed]
+                    raw_pending.sort(key=lambda t: t.get("timestamp", 0))
+                    scratch = dict(balances)
+                    pending = []
+                    for t in raw_pending:
+                        amt = t.get("amount", 0)
+                        frm = t.get("from")
+                        if amt > 0 and scratch.get(frm, 0) >= amt:
+                            scratch[frm] = scratch.get(frm, 0) - amt
+                            to = t.get("to")
+                            scratch[to] = scratch.get(to, 0) + amt
+                            pending.append(dict(t))
+                        if len(pending) >= 20:
+                            break
                 self._json({"confirmed": out, "pending": pending,
                             "total": total, "offset": offset, "limit": limit})
 
@@ -2875,8 +2919,26 @@ def make_handler(node):
                         })
                         if len(out) >= (1 if sig_want else limit):
                             break
-                    pending = [dict(t) for s, t in node.transfers.items()
-                               if s not in node.confirmed][:20]
+                    # Only show pending transfers a miner could actually include:
+                    # walk them oldest-first against a scratch copy of balances and
+                    # drop anything the sender can no longer afford (duplicate
+                    # spam-clicks past the sender's balance sat here forever and
+                    # made the Mint scream "stuck" about corpses).
+                    raw_pending = [t for s2, t in node.transfers.items()
+                                   if s2 not in node.confirmed]
+                    raw_pending.sort(key=lambda t: t.get("timestamp", 0))
+                    scratch = dict(balances)
+                    pending = []
+                    for t in raw_pending:
+                        amt = t.get("amount", 0)
+                        frm = t.get("from")
+                        if amt > 0 and scratch.get(frm, 0) >= amt:
+                            scratch[frm] = scratch.get(frm, 0) - amt
+                            to = t.get("to")
+                            scratch[to] = scratch.get(to, 0) + amt
+                            pending.append(dict(t))
+                        if len(pending) >= 20:
+                            break
                 self._json({"confirmed": out, "pending": pending,
                             "total": total, "offset": offset, "limit": limit})
 
@@ -3231,9 +3293,12 @@ def make_handler(node):
             if host and not host.startswith("localhost"):
                 url = "http://" + host if "://" not in host else host
                 if is_public_url(url):
-                    with node.lock:
-                        node.public_url = url.rstrip("/")
-                        node.reachable = True
+                    if node.lock.acquire(blocking=False):
+                        try:
+                            node.public_url = url.rstrip("/")
+                            node.reachable = True
+                        finally:
+                            node.lock.release()
 
         def log_message(self, *a): pass
         def log_error(self, *a): pass
@@ -3889,7 +3954,7 @@ def sync_chain(node):
             while guard < 400:
                 guard += 1
                 cur = len(node.chain.chain)
-                batch = get_json(peer.rstrip("/") + "/chain?from=" + str(cur) + "&count=100", timeout=45)
+                batch = get_json(peer.rstrip("/") + "/chain?from=" + str(cur) + "&count=25", timeout=60)
                 if not (isinstance(batch, list) and batch):
                     break
                 if not (isinstance(batch[0], dict)
@@ -3910,7 +3975,7 @@ def sync_chain(node):
                         break
                 except Exception:
                     break
-                if len(batch) < 100:
+                if len(batch) < 25:
                     break   # that was the last (partial) batch -- caught up
             part = None
             cand = node.chain if applied_any else None
@@ -4165,9 +4230,19 @@ def pull_pending_transfers(node):
     any valid ones it's missing to its own pool, so every miner -- reachable or
     not -- has the transfers and can include them in the next block it mines.
     """
+    MAX_PENDING_AGE = 24 * 3600     # a real transfer mines in minutes; older = corpse
     while True:
         time.sleep(6)
         try:
+            # Sweep corpses: duplicate clicks and unaffordable copies used to sit
+            # in the pool forever because nothing ever expired them.
+            now = time.time()
+            with node.lock:
+                dead = [s2 for s2, t in node.transfers.items()
+                        if s2 not in node.confirmed
+                        and now - t.get("timestamp", now) > MAX_PENDING_AGE]
+                for s2 in dead:
+                    node.transfers.pop(s2, None)
             if not node.peers:
                 continue
             for p in list(node.peers)[:5]:
@@ -4179,6 +4254,9 @@ def pull_pending_transfers(node):
                         continue
                     sig = tx.get("signature")
                     if not sig:
+                        continue
+                    # don't re-import corpses a peer still carries
+                    if now - tx.get("timestamp", now) > MAX_PENDING_AGE:
                         continue
                     with node.lock:
                         if sig in node.transfers or sig in node.confirmed:
