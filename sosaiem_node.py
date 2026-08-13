@@ -54,6 +54,14 @@ class ThreadingHTTPServer(_BaseHTTPServer):
         self._pool.submit(self._handle_pooled, request, client_address)
 
     def _handle_pooled(self, request, client_address):
+        # Hard lifetime for every connection. The 5s socket timeout only fires
+        # when ONE send stalls 5s -- a client sipping a byte every few seconds
+        # kept the write "progressing" forever and entombed the worker. Six such
+        # drippers took the whole pool: node healthy, nothing answering. The
+        # timer force-closes the socket, which snaps any stuck read/write.
+        killer = threading.Timer(90, lambda: self.shutdown_request(request))
+        killer.daemon = True
+        killer.start()
         try:
             try:
                 request.settimeout(5)
@@ -63,6 +71,10 @@ class ThreadingHTTPServer(_BaseHTTPServer):
         except Exception:
             pass
         finally:
+            try:
+                killer.cancel()
+            except Exception:
+                pass
             try:
                 self.shutdown_request(request)
             except Exception:
